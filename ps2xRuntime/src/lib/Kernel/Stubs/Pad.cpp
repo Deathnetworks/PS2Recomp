@@ -145,51 +145,47 @@ namespace ps2_stubs
                 return;
             }
 
-            // Keyboard mapping (PS2 -> keys):
-            // D-Pad: arrows, Square/Cross/Circle/Triangle: Z/X/C/V
-            // L1/R1: Q/E, L2/R2: 1/3, Start/Select: Enter/RightShift
-            // L3/R3: LeftCtrl/RightCtrl, Analog left: WASD
+            // PCSX2 default keyboard bindings (pcsx2/Input/InputManager.cpp:1786-1812):
+            // D-Pad: Arrows; Triangle/Circle/Cross/Square: I/L/K/J
+            // L1/L2/L3: Q/1/2; R1/R2/R3: E/3/4; Start/Select: Enter|KP_Enter/Backspace
+            // Left Analog: W/S/A/D; Right Analog: T/G/F/H
             setButton(state, kPadBtnUp, IsKeyDown(KEY_UP));
+            setButton(state, kPadBtnRight, IsKeyDown(KEY_RIGHT));
             setButton(state, kPadBtnDown, IsKeyDown(KEY_DOWN));
             setButton(state, kPadBtnLeft, IsKeyDown(KEY_LEFT));
-            setButton(state, kPadBtnRight, IsKeyDown(KEY_RIGHT));
 
-            setButton(state, kPadBtnSquare, IsKeyDown(KEY_Z));
-            setButton(state, kPadBtnCross, IsKeyDown(KEY_X));
-            setButton(state, kPadBtnCircle, IsKeyDown(KEY_C));
-            setButton(state, kPadBtnTriangle, IsKeyDown(KEY_V));
+            setButton(state, kPadBtnTriangle, IsKeyDown(KEY_I));
+            setButton(state, kPadBtnCircle, IsKeyDown(KEY_L));
+            setButton(state, kPadBtnCross, IsKeyDown(KEY_K));
+            setButton(state, kPadBtnSquare, IsKeyDown(KEY_J));
 
             setButton(state, kPadBtnL1, IsKeyDown(KEY_Q));
-            setButton(state, kPadBtnR1, IsKeyDown(KEY_E));
             setButton(state, kPadBtnL2, IsKeyDown(KEY_ONE));
+            setButton(state, kPadBtnL3, IsKeyDown(KEY_TWO));
+            setButton(state, kPadBtnR1, IsKeyDown(KEY_E));
             setButton(state, kPadBtnR2, IsKeyDown(KEY_THREE));
+            setButton(state, kPadBtnR3, IsKeyDown(KEY_FOUR));
 
-            setButton(state, kPadBtnStart, IsKeyDown(KEY_ENTER));
-            setButton(state, kPadBtnSelect, IsKeyDown(KEY_RIGHT_SHIFT));
-            setButton(state, kPadBtnL3, IsKeyDown(KEY_LEFT_CONTROL));
-            setButton(state, kPadBtnR3, IsKeyDown(KEY_RIGHT_CONTROL));
+            setButton(state, kPadBtnStart, IsKeyDown(KEY_ENTER) || IsKeyDown(KEY_KP_ENTER));
+            setButton(state, kPadBtnSelect, IsKeyDown(KEY_BACKSPACE));
 
             if (!allowAnalog)
             {
                 return;
             }
 
-            float ax = 0.0f;
-            float ay = 0.0f;
-            if (IsKeyDown(KEY_D))
-                ax += 1.0f;
-            if (IsKeyDown(KEY_A))
-                ax -= 1.0f;
-            if (IsKeyDown(KEY_S))
-                ay += 1.0f;
-            if (IsKeyDown(KEY_W))
-                ay -= 1.0f;
-
-            if (ax != 0.0f || ay != 0.0f)
+            auto applyKeyAxis = [](int negKey, int posKey, uint8_t &outAxis)
             {
-                state.lx = axisToByte(ax);
-                state.ly = axisToByte(ay);
-            }
+                if (IsKeyDown(negKey) || IsKeyDown(posKey))
+                {
+                    const int dir = (IsKeyDown(posKey) ? 1 : 0) - (IsKeyDown(negKey) ? 1 : 0);
+                    outAxis = (dir < 0) ? 0x00u : ((dir > 0) ? 0xFFu : 0x80u);
+                }
+            };
+            applyKeyAxis(KEY_A, KEY_D, state.lx);
+            applyKeyAxis(KEY_W, KEY_S, state.ly);
+            applyKeyAxis(KEY_F, KEY_H, state.rx);
+            applyKeyAxis(KEY_T, KEY_G, state.ry);
         }
 
         void resetPadStateLocked()
@@ -650,7 +646,7 @@ namespace ps2_stubs
                 const bool gamepadStartPressed =
                     (gamepad >= 0) && IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT);
                 const bool startPressed = (data[2] != 0xFFu || data[3] != 0xFFu ||
-                                           IsKeyDown(KEY_ENTER) || gamepadStartPressed);
+                                           IsKeyDown(KEY_ENTER) || IsKeyDown(KEY_KP_ENTER) || gamepadStartPressed);
                 if (startPressed)
                 {
                     const uint32_t guestButtons =
@@ -658,7 +654,7 @@ namespace ps2_stubs
                         static_cast<uint32_t>(static_cast<uint8_t>(data[3] ^ 0xFFu));
                     std::printf("[padread] port=%d slot=%d data2=0x%02x data3=0x%02x guestButtons=0x%04x enter=%d gamepadStart=%d\n",
                                 port, slot, data[2], data[3], guestButtons,
-                                IsKeyDown(KEY_ENTER) ? 1 : 0, gamepadStartPressed ? 1 : 0);
+                                (IsKeyDown(KEY_ENTER) || IsKeyDown(KEY_KP_ENTER)) ? 1 : 0, gamepadStartPressed ? 1 : 0);
                     ++g_padReadLogCount;
                 }
             }
