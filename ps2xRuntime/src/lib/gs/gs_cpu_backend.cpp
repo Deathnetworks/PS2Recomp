@@ -49,6 +49,22 @@ namespace
         return static_cast<u32>(r) | (g << 8) | (b << 16) | (a << 24);
     }
 
+    // Largest depth value a Z buffer format can hold. Z32 keeps all 32 bits,
+    // Z24 keeps 24 and Z16/Z16S keep 16.
+    u32 depthMaxForPsm(uint8_t psm)
+    {
+        switch (psm)
+        {
+        case GS_PSM_Z24:
+            return 0xFFFFFFu;
+        case GS_PSM_Z16:
+        case GS_PSM_Z16S:
+            return 0xFFFFu;
+        default:
+            return 0xFFFFFFFFu;
+        }
+    }
+
     uint32_t applyTexa(const GSTexaReg &texa, uint8_t psm, uint32_t texel)
     {
         if (psm == GS_PSM_CT32)
@@ -548,6 +564,60 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_vram || batch.vertexCount == 0u)
         return;
+    {
+        static const bool s_verboseDraw = []() {
+            const char *e = std::getenv("PS2_PRIMAL_VERBOSE_LOGS");
+            return e != nullptr && e[0] == '1';
+        }();
+        static uint32_t s_nzDrawLog = 0u;
+        if (s_verboseDraw && s_nzDrawLog < 25u)
+        {
+            const auto &st = batch.state;
+            bool nonClear = (st.prim.tme != 0);
+            if (!nonClear && st.prim.type != GS_PRIM_SPRITE)
+            {
+                for (uint32_t i = 0; !nonClear && i < batch.vertexCount && i < 3u; ++i)
+                {
+                    const auto &v = batch.vertices[i];
+                    if (v.r != 0 || v.g != 0 || v.b != 0) nonClear = true;
+                }
+            }
+            if (nonClear)
+            {
+                const uint32_t n = s_nzDrawLog++;
+                const auto &ctx = st.context;
+                const int ofx = ctx.xyoffset.ofx >> 4;
+                const int ofy = ctx.xyoffset.ofy >> 4;
+                std::fprintf(stderr,
+                    "[gs-nz-draw] #%u prim=%u tme=%u fst=%u vtx=%u fbp=0x%x sc=(%d,%d)-(%d,%d) tex0=(tbp=0x%x tbw=%u psm=%u tw=%u th=%u cbp=0x%x cpsm=%u)",
+                    n, static_cast<unsigned>(st.prim.type), static_cast<unsigned>(st.prim.tme),
+                    static_cast<unsigned>(st.prim.fst), static_cast<unsigned>(batch.vertexCount),
+                    static_cast<unsigned>(ctx.frame.fbp),
+                    ctx.scissor.x0, ctx.scissor.y0, ctx.scissor.x1, ctx.scissor.y1,
+                    static_cast<unsigned>(ctx.tex0.tbp0), static_cast<unsigned>(ctx.tex0.tbw),
+                    static_cast<unsigned>(ctx.tex0.psm), static_cast<unsigned>(ctx.tex0.tw),
+                    static_cast<unsigned>(ctx.tex0.th), static_cast<unsigned>(ctx.tex0.cbp),
+                    static_cast<unsigned>(ctx.tex0.cpsm));
+                for (uint32_t i = 0; i < batch.vertexCount && i < 3u; ++i)
+                {
+                    const auto &v = batch.vertices[i];
+                    if (st.prim.fst)
+                    {
+                        std::fprintf(stderr, " v%u=(%.1f,%.1f rgba=%u,%u,%u,%u uv=%.1f,%.1f)",
+                            i, static_cast<double>(v.x) - ofx, static_cast<double>(v.y) - ofy,
+                            v.r, v.g, v.b, v.a, v.u / 16.0, v.v / 16.0);
+                    }
+                    else
+                    {
+                        std::fprintf(stderr, " v%u=(%.1f,%.1f rgba=%u,%u,%u,%u stq=%.3f,%.3f,%.3f)",
+                            i, static_cast<double>(v.x) - ofx, static_cast<double>(v.y) - ofy,
+                            v.r, v.g, v.b, v.a, v.s, v.t, v.q);
+                    }
+                }
+                std::fprintf(stderr, "\n");
+            }
+        }
+    }
     DrawPrimitive(batch);
 }
 
@@ -878,6 +948,9 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
     }
 
     const uint32_t ztestMethod = static_cast<uint32_t>((ctx.test >> 17) & 3u);
+    // TEST.ZTE gates the whole depth comparison: with ZTE == 0 the GS skips the
+    // depth test and never touches the depth buffer.
+    const bool zTestEnabled = ((ctx.test >> 16) & 0x1u) != 0u;
     const bool alphaBlendEnabled = state.prim.abe;
     const bool preserveDestinationAlpha = writeMask.writeRgb && !writeMask.writeAlpha && fpsm == GS_PSM_CT32;
     const bool destinationAlphaTestNeedsRead = ((ctx.test >> 14) & 0x1u) != 0u && (fpsm == GS_PSM_CT32 || fpsm == GS_PSM_CT16 || fpsm == GS_PSM_CT16S);
@@ -909,24 +982,32 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
         return;
     }
 
-    bool zpass = false;
+    // The depth buffer only stores Z24 or Z16 values, so clamp the incoming Z to
+    // the format maximum and mask the stored Z the same way.
+    const uint32_t zmax = depthMaxForPsm(static_cast<uint8_t>(zpsm));
+    const uint32_t zClamped = std::min(static_cast<uint32_t>(z), zmax);
+
+    bool zpass = true;
     uint32_t storedZ = 0u;
-    switch (ztestMethod)
+    if (zTestEnabled)
     {
-    case 0:
-        zpass = false;
-        break;
-    case 1:
-        zpass = true;
-        break;
-    case 2:
-        storedZ = ReadVramUnlocked(zpsm, zbp, fbw, x, y);
-        zpass = static_cast<uint32_t>(z) >= storedZ;
-        break;
-    case 3:
-        storedZ = ReadVramUnlocked(zpsm, zbp, fbw, x, y);
-        zpass = static_cast<uint32_t>(z) > storedZ;
-        break;
+        switch (ztestMethod)
+        {
+        case 0:
+            zpass = false;
+            break;
+        case 1:
+            zpass = true;
+            break;
+        case 2:
+            storedZ = ReadVramUnlocked(zpsm, zbp, fbw, x, y) & zmax;
+            zpass = zClamped >= storedZ;
+            break;
+        case 3:
+            storedZ = ReadVramUnlocked(zpsm, zbp, fbw, x, y) & zmax;
+            zpass = zClamped > storedZ;
+            break;
+        }
     }
 
     if (!zpass)
@@ -1006,9 +1087,9 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
         WriteVramUnlocked(fpsm, fbp, fbw, x, y, pixel);
     }
 
-    if (writeMask.writeDepth && !ctx.zbuf.zmask)
+    if (writeMask.writeDepth && zTestEnabled && !ctx.zbuf.zmask)
     {
-        WriteVramUnlocked(zpsm, zbp, fbw, x, y, z);
+        WriteVramUnlocked(zpsm, zbp, fbw, x, y, zClamped);
     }
 }
 
@@ -1175,9 +1256,11 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
     int y1 = static_cast<int>(v1.y) - ofy;
     u32 z1 = static_cast<u32>(v1.z);
 
-    if (x0 > x1)
+    const bool swapX = (x0 > x1);
+    const bool swapY = (y0 > y1);
+    if (swapX)
         std::swap(x0, x1);
-    if (y0 > y1)
+    if (swapY)
         std::swap(y0, y1);
 
     const int unclippedX0 = x0;
@@ -1212,10 +1295,10 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
         float u0f, v0f, u1f, v1f;
         if (state.prim.fst)
         {
-            u0f = static_cast<float>(v0.u >> 4);
-            v0f = static_cast<float>(v0.v >> 4);
-            u1f = static_cast<float>(v1.u >> 4);
-            v1f = static_cast<float>(v1.v >> 4);
+            u0f = static_cast<float>(v0.u) / 16.0f;
+            v0f = static_cast<float>(v0.v) / 16.0f;
+            u1f = static_cast<float>(v1.u) / 16.0f;
+            v1f = static_cast<float>(v1.v) / 16.0f;
         }
         else
         {
@@ -1226,6 +1309,10 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
             u1f = (v1.s / q1) * static_cast<float>(texW);
             v1f = (v1.t / q1) * static_cast<float>(texH);
         }
+        if (swapX)
+            std::swap(u0f, u1f);
+        if (swapY)
+            std::swap(v0f, v1f);
 
         float spriteW = static_cast<float>(spanX);
         float spriteH = static_cast<float>(spanY);
@@ -1579,9 +1666,11 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
             break;
         }
         default:
+            m_texturePageCache.Invalidate();
             return;
         }
     }
+    m_texturePageCache.Invalidate();
 }
 
 void GSCpuBackend::PerformLocalToLocalTransfer()
@@ -1622,6 +1711,7 @@ void GSCpuBackend::PerformLocalToLocalTransfer()
 
     m_transferState.copiedPixels = total;
     m_transferState.direction = 3u;
+    m_texturePageCache.Invalidate();
 }
 
 void GSCpuBackend::PerformLocalToHostTransfer()

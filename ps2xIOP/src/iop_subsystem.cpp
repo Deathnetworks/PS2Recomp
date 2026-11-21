@@ -21,8 +21,11 @@ namespace ps2x::iop
               emulator(hostRef)
         {
             coreServices.emplace_back(detail::createMcservService(host));
+            coreServices.emplace_back(detail::createCdvdfsvService(host));
+            coreServices.emplace_back(detail::createFileioService(host));
             coreServices.emplace_back(detail::createDbcmanService(host));
             coreServices.emplace_back(detail::createLibSdService(host));
+            coreServices.emplace_back(detail::createPrimalPrivateService(host));
             refreshServiceModuleKeys();
             rebuildRoutes();
         }

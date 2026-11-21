@@ -1,5 +1,6 @@
 #include "ps2_runtime.h"
 #include "games_database.h"
+#include "primal_test_harness.h"
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
 #include "ps2_debug_panel.h"
 #endif
@@ -142,10 +143,55 @@ namespace
 
     std::filesystem::path getExecutablePath(int argc, char *argv[])
     {
-        if (argc >= 2 && argv[1] && argv[1][0] != '\0')
+        std::string positionalElf;
+        for (int i = 1; i < argc; ++i)
+        {
+            if (!argv[i] || argv[i][0] == '\0')
+                continue;
+            const std::string arg = argv[i];
+            if (arg == "--headless")
+            {
+                primal::harness::config().headless = true;
+                primal::harness::config().enabled = true;
+            }
+            else if (arg == "--ref-gs")
+            {
+                primal::harness::config().refGs = true;
+                primal::harness::config().enabled = true;
+            }
+            else if (arg == "--input-script" && i + 1 < argc)
+            {
+                primal::harness::loadInputScript(argv[++i]);
+            }
+            else if (arg == "--shots-dir" && i + 1 < argc)
+            {
+                primal::harness::config().shotsDir = argv[++i];
+                primal::harness::config().enabled = true;
+            }
+            else if (arg == "--explore-log" && i + 1 < argc)
+            {
+                primal::harness::config().exploreLogPath = argv[++i];
+                primal::harness::config().enabled = true;
+            }
+            else if (arg == "--shot-interval" && i + 1 < argc)
+            {
+                primal::harness::config().shotInterval = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+                primal::harness::config().enabled = true;
+            }
+            else if (arg == "--max-frames" && i + 1 < argc)
+            {
+                primal::harness::config().maxFrames = static_cast<uint64_t>(std::strtoull(argv[++i], nullptr, 10));
+                primal::harness::config().enabled = true;
+            }
+            else if (arg[0] != '-' && positionalElf.empty())
+            {
+                positionalElf = arg;
+            }
+        }
+        if (!positionalElf.empty())
         {
             std::cout << "Using argv boot path" << std::endl;
-            return std::filesystem::path(argv[1]);
+            return std::filesystem::path(positionalElf);
         }
 #if defined(PS2X_DEFAULT_BOOT_ELF)
         std::cout << "Using default boot file" << std::endl;
@@ -173,6 +219,7 @@ int main(int argc, char *argv[])
 
     try
     {
+        primal::harness::initFromEnv();
         std::filesystem::path pathObj = getExecutablePath(argc, argv);
 
         std::string filePathStr = pathObj.string();

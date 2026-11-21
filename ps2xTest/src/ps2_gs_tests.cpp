@@ -3778,6 +3778,33 @@ void register_ps2_gs_tests()
                      "RGB_ONLY-as-FB_ONLY should preserve CT16 depth");
         });
 
+        tc.Run("GS ZTE=0 skips the depth test and blocks depth writes", [](TestCase &t)
+        {
+            constexpr uint32_t kInitialFramebuffer = 0xAB030201u;
+            constexpr uint32_t kInitialDepth = 0xFFFFFFFFu;
+
+            // ZTE = 0 with ZTST = GEQUAL: the stored depth (0xFFFFFFFF) would
+            // reject the source depth (0x22222222) if the comparison ran.
+            constexpr uint64_t kZteOff = (2ull << 17);
+            const GsPixelTestResult zteOff =
+                drawGsPixelForTests(GS_PSM_CT32, kZteOff, false,
+                                    kInitialFramebuffer, kInitialDepth, 0x80u);
+            t.Equals(zteOff.framebuffer, 0x80563412u,
+                     "ZTE=0 should skip the depth comparison and write the framebuffer");
+            t.Equals(zteOff.depth, kInitialDepth,
+                     "ZTE=0 should block depth writes");
+
+            // ZTE = 1 with the same ZTST still rejects the pixel.
+            constexpr uint64_t kZteOn = (1ull << 16) | (2ull << 17);
+            const GsPixelTestResult zteOn =
+                drawGsPixelForTests(GS_PSM_CT32, kZteOn, false,
+                                    kInitialFramebuffer, kInitialDepth, 0x80u);
+            t.Equals(zteOn.framebuffer, kInitialFramebuffer,
+                     "ZTE=1 with ZTST=GEQUAL should reject a pixel behind the stored depth");
+            t.Equals(zteOn.depth, kInitialDepth,
+                     "a rejected pixel should not update depth");
+        });
+
         tc.Run("GS ZMSK suppresses depth without suppressing framebuffer writes", [](TestCase &t)
         {
             constexpr uint64_t kTest =

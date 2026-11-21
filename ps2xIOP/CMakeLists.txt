@@ -25,9 +25,12 @@ add_library(ps2_iop STATIC
     src/emulator/imports/iop_sysmem.cpp
     src/emulator/imports/iop_timrman.cpp
     src/emulator/imports/iop_vblank.cpp
+    src/modules/cdvdfsv.cpp
     src/modules/dbcman.cpp
+    src/modules/fileio.cpp
     src/modules/libsd.cpp
     src/modules/mcserv.cpp
+    src/modules/primal_private.cpp
 )
 
 target_compile_features(ps2_iop PUBLIC cxx_std_20)

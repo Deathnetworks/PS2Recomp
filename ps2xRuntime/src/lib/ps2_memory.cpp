@@ -2339,6 +2339,29 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
         return val;
     }
 
+    if (address >= 0x10003C00u && address <= 0x10003CE0u)
+    {
+        switch (address)
+        {
+        case 0x10003C00u: return vif1_regs.stat;
+        case 0x10003C10u: return vif1_regs.fbrst;
+        case 0x10003C20u: return vif1_regs.err;
+        case 0x10003C30u: return vif1_regs.mark;
+        case 0x10003C40u: return vif1_regs.cycle;
+        case 0x10003C50u: return vif1_regs.mode;
+        case 0x10003C60u: return vif1_regs.num;
+        case 0x10003C70u: return vif1_regs.mask;
+        case 0x10003C80u: return vif1_regs.code;
+        case 0x10003C90u: return vif1_regs.itops;
+        case 0x10003CA0u: return vif1_regs.base;
+        case 0x10003CB0u: return vif1_regs.ofst;
+        case 0x10003CC0u: return vif1_regs.top;
+        case 0x10003CD0u: return vif1_regs.itop;
+        case 0x10003CE0u: return vif1_regs.tops;
+        default: return 0u;
+        }
+    }
+
     if (address == 0x10003020u) // GIF_STAT
     {
         uint32_t stat = m_ioRegisters.count(address) ? m_ioRegisters[address] : 0u;

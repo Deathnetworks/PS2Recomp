@@ -514,6 +514,19 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
     request.display1 = m_privRegs->display1;
     request.dispfb2 = m_privRegs->dispfb2;
     request.display2 = m_privRegs->display2;
+    {
+        // PS2_FORCE_FBP0=1: present the buffer at fbp=0 regardless of DISPFB1/DISPFB2,
+        // to check whether the guest renders into a different frame than it displays.
+        static const bool s_fbp0 = [] {
+            const char *e = std::getenv("PS2_FORCE_FBP0");
+            return e != nullptr && e[0] == '1';
+        }();
+        if (s_fbp0)
+        {
+            request.dispfb1 = request.dispfb1 & ~0x1FFu;
+            request.dispfb2 = request.dispfb2 & ~0x1FFu;
+        }
+    }
     request.bgcolor = m_privRegs->bgcolor;
     request.vsyncTick = m_privRegs->vsyncTick.load(std::memory_order_acquire);
     request.contextFrames[0] = m_ctx[0].frame;

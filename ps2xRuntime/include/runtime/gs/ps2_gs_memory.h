@@ -400,7 +400,8 @@ namespace GSMem
 		constexpr auto page_extent = PageExtent();
 
 		const u32 base_page = base / BlocksPerPage();
-		const u32 row = (y / page_extent.y) * ((bw * 64) / page_extent.x); // T8 and T4 need a / 2 of bw
+		const u32 pages_per_row = (bw * 64u + page_extent.x - 1u) / page_extent.x;
+		const u32 row = (y / page_extent.y) * (pages_per_row > 0u ? pages_per_row : 1u);
 		const u32 col = x / page_extent.x;
 
 		return static_cast<usz>(base_page) + row + col;

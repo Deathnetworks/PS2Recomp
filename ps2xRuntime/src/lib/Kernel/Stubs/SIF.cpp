@@ -80,11 +80,35 @@ namespace ps2_stubs
         uint32_t g_sifGetRegLogCount = 0u;
         uint32_t g_sifSetRegLogCount = 0u;
 
+        // IOP side SIF command transport state.
+        struct SifRpcServerState
+        {
+            uint32_t serverData = 0u;   // IOP RAM address of the server data block
+            uint32_t buffer = 0u;       // IOP RAM address of the server data buffer
+            uint32_t clientBuffer = 0u; // IOP RAM address of the client data buffer
+        };
+
+        uint32_t g_sifIopCommandBuffer = 0u; // IOP RAM address of the SIF command buffer
+        uint32_t g_sifEePacketBuffer = 0u;   // EE address the IOP replies to
+        std::unordered_map<uint32_t, SifRpcServerState> g_sifRpcServers;
+
         constexpr uint32_t kSifRegBootStatus = 0x4u;
-        constexpr uint32_t kSifRegMainAddr = 0x80000000u;
-        constexpr uint32_t kSifRegSubAddr = 0x80000001u;
-        constexpr uint32_t kSifRegMsCom = 0x80000002u;
-        constexpr uint32_t kSifBootReadyMask = 0x00020000u;
+        // SIF register map used by the hardware and by the classic PS2 SDK:
+        //   0x00000002 SIF_REG_SUBADDR    - IOP side SIF packet buffer
+        //   0x00000004 SIF_REG_BOOT_STATUS
+        //   0x80000000 SIF_SYSREG_SUBADDR - IOP side SIF packet buffer
+        //   0x80000001 SIF_SYSREG_MAINADDR- EE side cmd_data pointer
+        //   0x80000002 SIF_SYSREG_RPCINIT - RPC initialised flag
+        constexpr uint32_t kSifRegSubAddr = 0x2u;
+        constexpr uint32_t kSifSysRegSubAddr = 0x80000000u;
+        constexpr uint32_t kSifSysRegMainAddr = 0x80000001u;
+        constexpr uint32_t kSifSysRegRpcInit = 0x80000002u;
+        // SIF register 4 reports the state of the IOP side services.
+        //   0x00020000 command interface initialised
+        //   0x00040000 disc services ready
+        constexpr uint32_t kSifBootReadyMask = 0x00060000u;
+        // The IOP owns the service status bits, the guest only reads them.
+        constexpr uint32_t kSifCdReadyMask = 0x00040000u;
 
         void seedDefaultSifRegsLocked()
         {
@@ -98,9 +122,12 @@ namespace ps2_stubs
             g_sifSetRegLogCount = 0u;
 
             g_sifRegs[kSifRegBootStatus] = kSifBootReadyMask;
-            g_sifRegs[kSifRegMainAddr] = 0u;
-            g_sifRegs[kSifRegSubAddr] = 0u;
-            g_sifRegs[kSifRegMsCom] = 0u;
+            g_sifRegs[kSifSysRegSubAddr] = 0u;
+            g_sifRegs[kSifSysRegMainAddr] = 0u;
+            g_sifRegs[kSifSysRegRpcInit] = 0u;
+            g_sifIopCommandBuffer = 0u;
+            g_sifEePacketBuffer = 0u;
+            g_sifRpcServers.clear();
         }
 
         bool shouldTraceSifReg(uint32_t reg)
@@ -217,6 +244,386 @@ namespace ps2_stubs
                 *destination = bytes[i];
             }
             return true;
+        }
+
+        // ------------------------------------------------------------------
+        // IOP side SIF command transport.
+        //
+        // Games built with the classic PS2 SDK drive RPC through the library
+        // protocol instead of the modern syscall level RPC: the EE DMAs a
+        // SIF command packet into the IOP side SIF buffer and waits for an
+        // RPC_END packet that the IOP delivers through the SIF0 DMA
+        // interrupt. Only the modern path existed so far, so those games
+        // waited for a reply that could never arrive.
+        //
+        // Command packet layout (as written by the guest SIF library):
+        //   +0x00 u8  psize   - total packet size in bytes
+        //   +0x04 u32 dsize   - size of the trailing extra data block
+        //   +0x08 u32 cid     - command id
+        //   +0x0C u32 opt     - command options (bit 0 = RPC init)
+        //   +0x10      payload
+        // ------------------------------------------------------------------
+
+        constexpr uint32_t kSifCidChangeSaddr = 0x80000000u;
+        constexpr uint32_t kSifCidInitCmd = 0x80000002u;
+        constexpr uint32_t kSifCidRpcEnd = 0x80000008u;
+        constexpr uint32_t kSifCidRpcBind = 0x80000009u;
+        constexpr uint32_t kSifCidRpcCall = 0x8000000Au;
+        constexpr uint32_t kSifCidRpcRdata = 0x8000000Cu;
+
+        constexpr uint32_t kSifCmdHeaderSize = 16u;
+        constexpr uint32_t kSifIopCommandBufferSize = 0x100u;
+        constexpr uint32_t kSifRpcServerDataSize = 0x40u;
+        constexpr uint32_t kSifRpcBufferSize = 0x2000u;
+
+        uint32_t ensureSifIopCommandBuffer(PS2Runtime *runtime)
+        {
+            if (g_sifIopCommandBuffer != 0u)
+                return g_sifIopCommandBuffer;
+            if (!runtime)
+                return 0u;
+            const uint32_t address = runtime->allocateIopMemory(kSifIopCommandBufferSize, 16u);
+            if (address != 0u)
+                g_sifIopCommandBuffer = address;
+            return g_sifIopCommandBuffer;
+        }
+
+        uint32_t readSifRegisterLocked(uint32_t reg)
+        {
+            const auto it = g_sifRegs.find(reg);
+            return it == g_sifRegs.end() ? 0u : it->second;
+        }
+
+        uint32_t readEeWord(uint8_t *rdram, uint32_t address)
+        {
+            const uint8_t *const bytes = getConstMemPtr(rdram, address);
+            if (!bytes)
+                return 0u;
+            return static_cast<uint32_t>(bytes[0]) |
+                   (static_cast<uint32_t>(bytes[1]) << 8) |
+                   (static_cast<uint32_t>(bytes[2]) << 16) |
+                   (static_cast<uint32_t>(bytes[3]) << 24);
+        }
+
+        uint32_t readPacketWord(const uint8_t *packet, uint32_t packetSize, uint32_t offset)
+        {
+            if (!packet || offset + 4u > packetSize)
+                return 0u;
+            return static_cast<uint32_t>(packet[offset]) |
+                   (static_cast<uint32_t>(packet[offset + 1u]) << 8) |
+                   (static_cast<uint32_t>(packet[offset + 2u]) << 16) |
+                   (static_cast<uint32_t>(packet[offset + 3u]) << 24);
+        }
+
+        void writePacketWord(std::vector<uint8_t> &packet, uint32_t offset, uint32_t value)
+        {
+            if (offset + 4u > packet.size())
+                return;
+            packet[offset] = static_cast<uint8_t>(value & 0xFFu);
+            packet[offset + 1u] = static_cast<uint8_t>((value >> 8) & 0xFFu);
+            packet[offset + 2u] = static_cast<uint8_t>((value >> 16) & 0xFFu);
+            packet[offset + 3u] = static_cast<uint8_t>((value >> 24) & 0xFFu);
+        }
+
+        // The guest side cmd_data block (classic SDK layout):
+        //   +0x00 pktbuf           - EE buffer that receives IOP packets
+        //   +0x04 unused
+        //   +0x08 iopbuf           - IOP side SIF buffer address
+        //   +0x0C sys_cmd_handlers - command id -> handler table
+        //   +0x10 nr_sys_handlers
+        //   +0x14 usr_cmd_handlers
+        //   +0x18 nr_usr_handlers
+        //   +0x1C sregs            - EE array of IOP status registers
+        struct SifGuestCmdData
+        {
+            uint32_t address = 0u;
+            uint32_t packetBuffer = 0u;
+            uint32_t iopBuffer = 0u;
+            uint32_t sregs = 0u;
+        };
+
+        SifGuestCmdData readGuestCmdData(uint8_t *rdram)
+        {
+            SifGuestCmdData data{};
+            uint32_t address = 0u;
+            {
+                std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+                address = readSifRegisterLocked(kSifSysRegMainAddr);
+            }
+            if (address == 0u)
+                return data;
+
+            data.address = address;
+            data.packetBuffer = readEeWord(rdram, address + 0x00u);
+            data.iopBuffer = readEeWord(rdram, address + 0x08u);
+            data.sregs = readEeWord(rdram, address + 0x1Cu);
+            return data;
+        }
+
+        void signalSifRpcReady(uint8_t *rdram)
+        {
+            const SifGuestCmdData cmdData = readGuestCmdData(rdram);
+            if (cmdData.sregs == 0u)
+                return;
+            const uint32_t value = 1u;
+            (void)writeEeRange(rdram, cmdData.sregs, &value, sizeof(value));
+        }
+
+        uint32_t guestPacketBuffer(uint8_t *rdram)
+        {
+            const SifGuestCmdData cmdData = readGuestCmdData(rdram);
+            uint32_t destination = 0u;
+            {
+                std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+                destination = g_sifEePacketBuffer;
+            }
+            if (destination == 0u)
+                destination = cmdData.packetBuffer;
+            return destination;
+        }
+
+        // The guest picks the packet up in its SIF0 DMA handler. The size byte
+        // stays set afterwards, so it has to be cleared once the packet was
+        // consumed, otherwise the next DMA would replay the stale packet.
+        void clearGuestPacketBuffer(uint8_t *rdram)
+        {
+            const uint32_t destination = guestPacketBuffer(rdram);
+            if (destination == 0u)
+                return;
+            const uint8_t empty = 0u;
+            (void)writeEeRange(rdram, destination, &empty, sizeof(empty));
+        }
+
+        void deliverSifPacket(PS2Runtime *runtime, uint8_t *rdram, const std::vector<uint8_t> &packet)
+        {
+            if (!runtime || packet.empty())
+                return;
+
+            const uint32_t destination = guestPacketBuffer(rdram);
+            if (destination == 0u)
+                return;
+            if (!writeEeRange(rdram, destination, packet.data(), static_cast<uint32_t>(packet.size())))
+                return;
+        }
+
+        void sendSifRpcEnd(PS2Runtime *runtime,
+                           uint8_t *rdram,
+                           uint32_t clientData,
+                           uint32_t commandId,
+                           uint32_t serverData,
+                           uint32_t buffer,
+                           uint32_t clientBuffer)
+        {
+            std::vector<uint8_t> packet(64u, 0u);
+            packet[0] = static_cast<uint8_t>(packet.size() & 0xFFu);
+            writePacketWord(packet, 0x08u, kSifCidRpcEnd);
+            writePacketWord(packet, 0x1Cu, clientData);
+            writePacketWord(packet, 0x20u, commandId);
+            writePacketWord(packet, 0x24u, serverData);
+            writePacketWord(packet, 0x28u, buffer);
+            writePacketWord(packet, 0x2Cu, clientBuffer);
+            deliverSifPacket(runtime, rdram, packet);
+        }
+
+        void handleSifRpcBind(PS2Runtime *runtime,
+                              uint8_t *rdram,
+                              const uint8_t *packet,
+                              uint32_t packetSize)
+        {
+            const uint32_t clientData = readPacketWord(packet, packetSize, 0x1Cu);
+            const uint32_t sid = readPacketWord(packet, packetSize, 0x20u);
+
+            uint32_t serverData = 0u;
+            uint32_t buffer = 0u;
+            uint32_t clientBuffer = 0u;
+
+            if (PS2IopTransport::canBindRpc(runtime, sid))
+            {
+                SifRpcServerState state;
+                bool found = false;
+                {
+                    std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+                    const auto it = g_sifRpcServers.find(sid);
+                    if (it != g_sifRpcServers.end())
+                    {
+                        state = it->second;
+                        found = true;
+                    }
+                }
+
+                if (!found)
+                {
+                    state.serverData = runtime->allocateIopMemory(kSifRpcServerDataSize, 16u);
+                    state.buffer = runtime->allocateIopMemory(kSifRpcBufferSize, 16u);
+                    state.clientBuffer = runtime->allocateIopMemory(kSifRpcBufferSize, 16u);
+                    if (state.serverData != 0u && state.buffer != 0u && state.clientBuffer != 0u)
+                    {
+                        std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+                        g_sifRpcServers[sid] = state;
+                    }
+                    else
+                    {
+                        state = SifRpcServerState{};
+                    }
+                }
+
+                serverData = state.serverData;
+                buffer = state.buffer;
+                clientBuffer = state.clientBuffer;
+            }
+            else
+            {
+                PS2_IF_AGRESSIVE_LOGS({
+                    std::cerr << "[SIF:rpc] bind sid=0x" << std::hex << sid
+                              << " has no IOP service, replying without server data"
+                              << std::dec << std::endl;
+                });
+            }
+
+            sendSifRpcEnd(runtime, rdram, clientData, kSifCidRpcBind, serverData, buffer, clientBuffer);
+        }
+
+        void handleSifRpcCall(PS2Runtime *runtime,
+                              uint8_t *rdram,
+                              const uint8_t *packet,
+                              uint32_t packetSize)
+        {
+            const uint32_t clientData = readPacketWord(packet, packetSize, 0x1Cu);
+            const uint32_t function = readPacketWord(packet, packetSize, 0x20u);
+            const uint32_t sendSize = readPacketWord(packet, packetSize, 0x24u);
+            const uint32_t receiveBuffer = readPacketWord(packet, packetSize, 0x28u);
+            const uint32_t receiveSize = readPacketWord(packet, packetSize, 0x2Cu);
+            const uint32_t mode = readPacketWord(packet, packetSize, 0x30u);
+            const uint32_t serverData = readPacketWord(packet, packetSize, 0x34u);
+
+            uint32_t sid = 0u;
+            SifRpcServerState state;
+            {
+                std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+                for (const auto &entry : g_sifRpcServers)
+                {
+                    if (entry.second.serverData == serverData && serverData != 0u)
+                    {
+                        sid = entry.first;
+                        state = entry.second;
+                        break;
+                    }
+                }
+            }
+
+            {
+                static uint32_t s_callLogCount = 0;
+                if (s_callLogCount < 300u)
+                {
+                    ++s_callLogCount;
+                    std::cerr << "[SIF:rpc-call] #" << std::dec << s_callLogCount
+                              << " sd=0x" << std::hex << serverData << " sid=0x" << sid
+                              << " function=0x" << function << " sendSize=0x" << sendSize
+                              << std::dec << std::endl;
+                }
+            }
+
+            if (sid == 0u)
+            {
+                PS2_IF_AGRESSIVE_LOGS({
+                    std::cerr << "[SIF:rpc] call without a bound server (sd=0x" << std::hex << serverData
+                              << " function=0x" << function << ")" << std::dec << std::endl;
+                });
+                sendSifRpcEnd(runtime, rdram, clientData, kSifCidRpcCall, serverData, 0u, 0u);
+                return;
+            }
+
+            // The classic protocol keeps the request payload in the IOP side
+            // server buffer and copies the result back into the guest receive
+            // buffer before the RPC_END packet is sent.
+            std::vector<uint8_t> parameters(sendSize, 0u);
+            if (sendSize != 0u)
+                (void)runtime->readIopMemory(state.buffer, parameters.data(), parameters.size());
+
+            const uint32_t resultSize = receiveSize != 0u ? receiveSize : 4u;
+            std::vector<uint8_t> result(resultSize, 0u);
+
+            const uint32_t parameterScratch = sendSize != 0u ? runtime->guestMalloc(sendSize, 16u) : 0u;
+            const uint32_t resultScratch = runtime->guestMalloc(resultSize, 16u);
+            if (parameterScratch != 0u && sendSize != 0u)
+                (void)writeEeRange(rdram, parameterScratch, parameters.data(), sendSize);
+
+            ps2x::iop::RpcRequest request{};
+            request.clientAddress = clientData;
+            request.serverAddress = serverData;
+            request.serverBuffer = state.buffer;
+            request.sid = sid;
+            request.function = function;
+            request.mode = mode;
+            request.send = {parameterScratch, sendSize};
+            request.receive = {resultScratch, resultSize};
+
+            const ps2x::iop::RpcResult rpcResult = PS2IopTransport::handleRpc(runtime, rdram, nullptr, request);
+            (void)rpcResult;
+
+            if (resultScratch != 0u)
+            {
+                (void)readEeRange(rdram, resultScratch, result.data(), result.size());
+                (void)runtime->writeIopMemory(state.buffer, result.data(), result.size());
+                if (receiveBuffer != 0u)
+                    (void)writeEeRange(rdram, receiveBuffer, result.data(), result.size());
+                runtime->guestFree(resultScratch);
+            }
+            if (parameterScratch != 0u)
+                runtime->guestFree(parameterScratch);
+
+            sendSifRpcEnd(runtime, rdram, clientData, kSifCidRpcCall, serverData, state.buffer, state.clientBuffer);
+        }
+
+        void dispatchSifIopCommand(PS2Runtime *runtime, uint8_t *rdram, uint32_t bufferAddress)
+        {
+            if (!runtime || bufferAddress == 0u)
+                return;
+
+            // The previous reply was consumed by the guest already, drop its
+            // size byte so it cannot be replayed by the next DMA interrupt.
+            clearGuestPacketBuffer(rdram);
+
+            std::vector<uint8_t> buffer(kSifIopCommandBufferSize, 0u);
+            if (!runtime->readIopMemory(bufferAddress, buffer.data(), buffer.size()))
+                return;
+
+            const uint32_t packetSize = buffer[0];
+            if (packetSize < kSifCmdHeaderSize || packetSize > buffer.size())
+                return;
+
+            const uint32_t commandId = readPacketWord(buffer.data(), packetSize, 0x08u);
+            const uint32_t option = readPacketWord(buffer.data(), packetSize, 0x0Cu);
+
+            switch (commandId)
+            {
+            case kSifCidChangeSaddr:
+            {
+                const uint32_t replyAddress = readPacketWord(buffer.data(), packetSize, 0x10u);
+                std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+                g_sifEePacketBuffer = replyAddress;
+                break;
+            }
+            case kSifCidInitCmd:
+                if ((option & 1u) != 0u)
+                    signalSifRpcReady(rdram);
+                break;
+            case kSifCidRpcBind:
+                handleSifRpcBind(runtime, rdram, buffer.data(), packetSize);
+                break;
+            case kSifCidRpcCall:
+                handleSifRpcCall(runtime, rdram, buffer.data(), packetSize);
+                break;
+            case kSifCidRpcRdata:
+            {
+                const uint32_t clientData = readPacketWord(buffer.data(), packetSize, 0x1Cu);
+                const uint32_t originalId = readPacketWord(buffer.data(), packetSize, 0x20u);
+                sendSifRpcEnd(runtime, rdram, clientData, originalId, 0u, 0u, 0u);
+                break;
+            }
+            default:
+                break;
+            }
         }
     }
 
@@ -472,6 +879,18 @@ namespace ps2_stubs
             if (it != g_sifRegs.end())
             {
                 value = it->second;
+            }
+            if (value == 0u && (reg == kSifSysRegSubAddr || reg == kSifRegSubAddr))
+            {
+                // The guest needs the address of the IOP side SIF buffer to
+                // send command packets to.
+                value = ensureSifIopCommandBuffer(runtime);
+            }
+            if (reg == kSifRegBootStatus)
+            {
+                // The disc services are always available in the runtime, the
+                // guest waits for this bit before it talks to them.
+                value |= kSifCdReadyMask;
             }
             shouldLog = shouldTraceSifReg(reg) && g_sifGetRegLogCount < 128u;
             if (shouldLog)
@@ -730,6 +1149,18 @@ namespace ps2_stubs
                                                                         xfer.dest,
                                                                         static_cast<uint32_t>(xfer.size),
                                                                     });
+                }
+
+                uint32_t commandBuffer = 0u;
+                {
+                    std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+                    commandBuffer = g_sifIopCommandBuffer;
+                }
+                if (commandBuffer != 0u && xfer.dest == commandBuffer)
+                {
+                    // A classic SDK command packet reached the IOP side SIF
+                    // buffer, answer it the way the IOP would.
+                    dispatchSifIopCommand(runtime, rdram, commandBuffer);
                 }
             }
         }

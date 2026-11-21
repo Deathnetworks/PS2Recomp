@@ -37,6 +37,7 @@ namespace ps2x::iop::detail
             "mcman",
             "xmcman",
             "mcserv",
+            "xmcserv",
             "libsd",
             "cdvdman",
             "cdvdfsv",

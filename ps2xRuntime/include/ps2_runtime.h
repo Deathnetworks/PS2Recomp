@@ -3,6 +3,7 @@
 
 #include <cstring>
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 #include <string>
 #include <string_view>
@@ -72,7 +73,7 @@ struct alignas(16) R5900Context
 
     // VU0 registers (when used in macro mode)
     __m128 vu0_vf[32];        // VU0 vector float registers
-    uint16_t vi[16];          // VU0 vector integer registers
+    uint16_t vi[32];          // VI regs: vi0-15 = VU0, vi16-31 = VU1 alias view (recompiler emits vi[27] for vcallmsr)
     float vu0_q;              // VU0 Q register (quotient)
     float vu0_p;              // VU0 P register (EFU result)
     float vu0_i;              // VU0 I register (integer value)
@@ -246,11 +247,30 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
                                const R5900Context *ctx)
 {
     (void)rdram;
-    (void)guestAddr;
     (void)size;
+    (void)op;
+    {
+        static const bool s_watch = [] {
+            const char *e = std::getenv("PS2_SLOT_WATCH");
+            return e != nullptr && e[0] == '1';
+        }();
+        if (s_watch && ctx != nullptr &&
+            ((guestAddr >= 0x1FFF000u && guestAddr < 0x2000000u &&
+              (valueLo == 0x4F0000ull || valueHi == 0x4F0000ull)) ||
+             guestAddr == 0x004F1F80u || guestAddr == 0x004F7118u || guestAddr == 0x004F7108u ||
+              guestAddr == 0x00485770u || guestAddr == 0x004F7114u || guestAddr == 0x004F7124u || guestAddr == 0x00485564u ||
+              guestAddr == 0x00489FB0u || guestAddr == 0x00489FDCu || guestAddr == 0x00489FE4u ||
+              guestAddr == 0x004DF400u || guestAddr == 0x004DF3D8u ||
+              (guestAddr >= 0x01019720u && guestAddr < 0x01019740u) ||
+              (guestAddr >= 0x004F22A8u && guestAddr < 0x004F2400u)))
+        {
+            RUNTIME_LOG("[wp] addr=0x" << std::hex << guestAddr << " val=0x" << valueLo
+                        << " pc=0x" << ctx->pc << std::dec << std::endl);
+        }
+    }
+    (void)guestAddr;
     (void)valueLo;
     (void)valueHi;
-    (void)op;
     (void)ctx;
     // TODO we dont need this anymore so on next release it will be deleted
 }
@@ -306,6 +326,16 @@ public:
                              DebugUiCallback drawCallback,
                              DebugUiCallback shutdownCallback,
                              void *userData);
+
+    using HostOverlayCallback = void (*)(PS2Runtime &runtime, float dstX, float dstY, float dstW, float dstH, void *userData);
+    void setHostOverlayCallbacks(HostOverlayCallback drawCallback,
+                                 HostOverlayCallback shutdownCallback,
+                                 void *userData)
+    {
+        m_hostOverlayDrawCallback = drawCallback;
+        m_hostOverlayShutdownCallback = shutdownCallback;
+        m_hostOverlayUserData = userData;
+    }
 
     using RecompiledFunction = void (*)(uint8_t *, R5900Context *, PS2Runtime *);
 
@@ -524,6 +554,9 @@ private:
     DebugUiCallback m_debugUiShutdownCallback = nullptr;
     void *m_debugUiUserData = nullptr;
     bool m_debugUiInitialized = false;
+    HostOverlayCallback m_hostOverlayDrawCallback = nullptr;
+    HostOverlayCallback m_hostOverlayShutdownCallback = nullptr;
+    void *m_hostOverlayUserData = nullptr;
 
 public:
     std::atomic<uint32_t> m_debugPc{0};

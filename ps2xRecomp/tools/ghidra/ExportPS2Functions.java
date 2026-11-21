@@ -1017,14 +1017,33 @@ public class ExportPS2Functions extends GhidraScript {
 
     @Override
     public void run() throws Exception {
-        File tomlFile = askFile("Choose output TOML config file", "Save");
-        if (tomlFile == null) {
-            return;
+        File tomlFile;
+        File csvFile;
+
+        // Headless mode: analyzeHeadless can pass the TOML and CSV paths as
+        // script arguments. Keep the interactive chooser as the default so the
+        // upstream desktop workflow remains unchanged.
+        String[] scriptArgs = getScriptArgs();
+        if (scriptArgs.length >= 2) {
+            tomlFile = new File(scriptArgs[0]).getAbsoluteFile();
+            csvFile = new File(scriptArgs[1]).getAbsoluteFile();
+        } else {
+            tomlFile = askFile("Choose output TOML config file", "Save");
+            if (tomlFile == null) {
+                return;
+            }
+
+            csvFile = askFile("Choose output CSV file", "Save");
+            if (csvFile == null) {
+                return;
+            }
         }
 
-        File csvFile = askFile("Choose output CSV file", "Save");
-        if (csvFile == null) {
-            return;
+        if (tomlFile.getParentFile() != null) {
+            tomlFile.getParentFile().mkdirs();
+        }
+        if (csvFile.getParentFile() != null) {
+            csvFile.getParentFile().mkdirs();
         }
 
         FunctionManager fm = currentProgram.getFunctionManager();

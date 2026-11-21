@@ -1,5 +1,6 @@
 #include "Common.h"
 #include "Dispatcher.h"
+#include "RPC.h"
 #include "System.h"
 
 namespace ps2_syscalls
@@ -252,6 +253,15 @@ namespace ps2_syscalls
             return true;
         case 0x64:
             FlushCache(rdram, ctx, runtime);
+            return true;
+        // EE syscall 0x6B is the SDK's SIF RPC init call: the guest's sifrpc
+        // thunk at 0x3E4AB0 (FUN_003e4ab0) issues it with one pointer argument
+        // while sceSifInitRpc runs, and the runtime answered
+        // "Unknown syscallId=0x6b" (attempt10). The handler already existed in
+        // Kernel/Syscalls/RPC.cpp but no dispatch branch reached it, the same
+        // missing-branch shape as the SIF register calls 0x79/0x7A below.
+        case 0x6B:
+            SifInitRpc(rdram, ctx, runtime);
             return true;
         case static_cast<uint32_t>(-0x68):
             iFlushCache(rdram, ctx, runtime);

@@ -221,6 +221,7 @@ namespace ps2_syscalls
 
         // PS2SDK EE t_ee_thread: status, func, stack, stack_size, gp_reg,
         // initial_priority, current_priority, attr, option.
+        { static const bool cl = [] { const char *e = std::getenv("PS2_SEMA_LOG"); return e != nullptr && e[0] == '1'; }(); static int cn = 0; if (cl && cn < 60) { ++cn; RUNTIME_LOG("[cthr] #" << cn << " entry=0x" << std::hex << param->func << " prio=" << std::dec << param->initial_priority << " attr=0x" << std::hex << param->attr << std::dec << std::endl); } }
         const EeThreadCreateParams decoded{
             param->attr,
             param->func,

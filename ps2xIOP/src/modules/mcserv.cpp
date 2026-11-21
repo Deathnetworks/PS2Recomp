@@ -169,7 +169,11 @@ namespace ps2x::iop::detail
 
             [[nodiscard]] std::string_view name() const override { return "MCSERV"; }
             [[nodiscard]] std::span<const uint32_t> sids() const override { return m_sids; }
-            [[nodiscard]] std::span<const std::string_view> moduleAliases() const override { return m_moduleAliases; }
+            // No module aliases: the memory-card manager is a ROM module on
+            // retail hardware, so it is always present. The aliases here made
+            // the service dormant in the no-BIOS HLE environment, where the
+            // guest never loads an "mcserv.irx", so the sid 0x80000400 bind
+            // was never answered and the guest's later RPC call was dropped.
 
             void reset() override
             {
@@ -188,6 +192,7 @@ namespace ps2x::iop::detail
 
                 Flavor flavor = Flavor::NewXmcserv;
                 const Operation operation = decodeOperation(request.function, flavor);
+                logCall(request, operation, flavor);
                 if (operation == Operation::Init)
                 {
                     const int32_t result = call(MemoryCardOperation::Init);
@@ -253,6 +258,56 @@ namespace ps2x::iop::detail
             }
 
         private:
+            static std::string_view operationName(Operation operation)
+            {
+                switch (operation)
+                {
+                case Operation::Init: return "Init";
+                case Operation::GetInfo: return "GetInfo";
+                case Operation::Open: return "Open";
+                case Operation::Close: return "Close";
+                case Operation::Seek: return "Seek";
+                case Operation::Read: return "Read";
+                case Operation::Write: return "Write";
+                case Operation::Flush: return "Flush";
+                case Operation::Chdir: return "Chdir";
+                case Operation::GetDir: return "GetDir";
+                case Operation::SetInfo: return "SetInfo";
+                case Operation::Delete: return "Delete";
+                case Operation::Format: return "Format";
+                case Operation::Unformat: return "Unformat";
+                case Operation::GetEnt: return "GetEnt";
+                case Operation::ChangePriority: return "ChangePriority";
+                case Operation::Unknown: break;
+                }
+                return "Unknown";
+            }
+
+            // Temporary telemetry: the guest's memory-card call sequence is
+            // only observable here, and the function-number flavour has to be
+            // confirmed against the guest instead of assumed.
+            void logCall(const RpcRequest &request, Operation operation, Flavor flavor)
+            {
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    if (m_callLogCount >= 32u)
+                    {
+                        return;
+                    }
+                    ++m_callLogCount;
+                }
+                std::ostringstream message;
+                message << "MCSERV call sid=0x" << std::hex << request.sid
+                        << " function=0x" << request.function
+                        << " operation=" << operationName(operation)
+                        << " flavor=" << (flavor == Flavor::NewXmcserv ? "new" : "old")
+                        << " send=0x" << request.send.address
+                        << " size=0x" << request.send.size
+                        << " receive=0x" << request.receive.address
+                        << " rsize=0x" << request.receive.size;
+                m_host.log(LogLevel::Info, message.str());
+            }
+
             int32_t call(MemoryCardOperation operation,
                          uint32_t a0 = 0u,
                          uint32_t a1 = 0u,
@@ -392,8 +447,8 @@ namespace ps2x::iop::detail
             IopHost &m_host;
             mutable std::mutex m_mutex;
             uint32_t m_unknownRpcLogCount = 0u;
+            uint32_t m_callLogCount = 0u;
             const std::array<uint32_t, 2> m_sids = {kMcservSid, kMcservDev9Sid};
-            const std::array<std::string_view, 2> m_moduleAliases = {"mcserv", "xmcserv"};
         };
     }
 

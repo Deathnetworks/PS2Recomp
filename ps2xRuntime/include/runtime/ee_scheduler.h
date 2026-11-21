@@ -426,6 +426,7 @@ private:
     bool m_insideInterrupt = false;
     uint32_t m_pendingEeTimerInterrupts = 0;
     uint64_t m_eeCycle = 0;
+    uint64_t m_unflushedCycles = 0;
     uint64_t m_sliceEndCycle = kDefaultTimeSliceCycles;
     std::thread::id m_executorThread{};
     std::atomic<bool> m_running{false};
