@@ -1559,7 +1559,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 }
 
                 const bool autoProcessTransfers =
-                    (channelBase == 0x1000A000u) ? (m_gifPacketCallback || m_gifArbiter != nullptr) : true;
+                    (channelBase == 0x1000A000u)
+                        ? ((m_gifPacketCallback || m_gifArbiter != nullptr) && m_vif1ExecutionDepth == 0u)
+                        : true;
                 if (autoProcessTransfers)
                 {
                     processPendingTransfers();
@@ -1660,11 +1662,19 @@ void PS2Memory::completeDmacChannel(uint32_t channelBase, uint32_t cause)
     queueCompletedDmacCause(cause);
 }
 
-void PS2Memory::processPendingTransfers()
+void PS2Memory::drainPendingGifTransfers()
 {
-    const bool hadGif = !m_pendingGifTransfers.empty();
+    if (m_gifArbiter)
+        m_gifArbiter->drain();
+
+    if (m_pendingGifTransfers.empty())
+        return;
+
+    std::vector<PendingTransfer> gifTransfers;
+    gifTransfers.swap(m_pendingGifTransfers);
+
     uint32_t observedGifQwc = 0u;
-    for (const auto &transfer : m_pendingGifTransfers)
+    for (const auto &transfer : gifTransfers)
     {
         const uint64_t transferQwc = !transfer.chainData.empty()
                                          ? (transfer.chainData.size() / 16u)
@@ -1679,9 +1689,9 @@ void PS2Memory::processPendingTransfers()
         gifStat = (gifStat & ~kGifFqcMask) | (observedGifQwc << 24u);
     }
 
-    for (size_t idx = 0; idx < m_pendingGifTransfers.size(); ++idx)
+    for (size_t idx = 0; idx < gifTransfers.size(); ++idx)
     {
-        auto &p = m_pendingGifTransfers[idx];
+        auto &p = gifTransfers[idx];
         if (!p.chainData.empty())
         {
             m_seenGifCopy = true;
@@ -1741,10 +1751,24 @@ void PS2Memory::processPendingTransfers()
             }
         }
     }
-    m_pendingGifTransfers.clear();
 
-    const bool hadVif0 = !m_pendingVif0Transfers.empty();
-    for (auto &p : m_pendingVif0Transfers)
+    if (m_gifArbiter)
+        m_gifArbiter->drain();
+
+    static constexpr uint32_t kGifChannel = 0x1000A000u;
+    completeDmacChannel(kGifChannel, 2u); // GIF channel
+    m_ioRegisters[kGifChannel + 0x20u] = 0u;
+}
+
+void PS2Memory::processPendingTransfers()
+{
+    if (m_vif1ExecutionDepth == 0u)
+        drainPendingGifTransfers();
+
+    std::vector<PendingTransfer> vif0Transfers;
+    vif0Transfers.swap(m_pendingVif0Transfers);
+    const bool hadVif0 = !vif0Transfers.empty();
+    for (auto &p : vif0Transfers)
     {
         if (!p.chainData.empty())
         {
@@ -1799,10 +1823,11 @@ void PS2Memory::processPendingTransfers()
             }
         }
     }
-    m_pendingVif0Transfers.clear();
 
-    const bool hadVif1 = !m_pendingVif1Transfers.empty();
-    for (auto &p : m_pendingVif1Transfers)
+    std::vector<PendingTransfer> vif1Transfers;
+    vif1Transfers.swap(m_pendingVif1Transfers);
+    const bool hadVif1 = !vif1Transfers.empty();
+    for (auto &p : vif1Transfers)
     {
         if (!p.chainData.empty())
         {
@@ -1857,50 +1882,25 @@ void PS2Memory::processPendingTransfers()
             }
         }
     }
-    m_pendingVif1Transfers.clear();
 
     if (m_gifArbiter)
         m_gifArbiter->drain();
+    if (m_vif1ExecutionDepth == 0u && !m_pendingGifTransfers.empty())
+    {
+        drainPendingGifTransfers();
+    }
 
-    static constexpr uint32_t GIF_CHANNEL = 0x1000A000;
     static constexpr uint32_t VIF0_CHANNEL = 0x10008000;
     static constexpr uint32_t VIF1_CHANNEL = 0x10009000;
-    static constexpr uint32_t D_STAT = 0x1000E010u;
 
-    auto raiseDStatChannel = [&](uint32_t channelBit)
-    {
-        uint32_t dstat = m_ioRegisters.count(D_STAT) ? m_ioRegisters[D_STAT] : 0u;
-        dstat |= (1u << channelBit);
-
-        const uint32_t status = dstat & 0x3FFu;
-        const uint32_t mask = (dstat >> 16) & 0x3FFu;
-        if ((status & mask) != 0u)
-            dstat |= (1u << 31);
-        else
-            dstat &= ~(1u << 31);
-
-        m_ioRegisters[D_STAT] = dstat;
-    };
-
-    if (hadGif)
-    {
-        raiseDStatChannel(2u); // GIF channel
-        queueCompletedDmacCause(2u);
-        m_ioRegisters[GIF_CHANNEL + 0x00] &= ~0x100u;
-        m_ioRegisters[GIF_CHANNEL + 0x20] = 0;
-    }
     if (hadVif0)
     {
-        raiseDStatChannel(0u); // VIF0 channel
-        queueCompletedDmacCause(0u);
-        m_ioRegisters[VIF0_CHANNEL + 0x00] &= ~0x100u;
+        completeDmacChannel(VIF0_CHANNEL, 0u); // VIF0 channel
         m_ioRegisters[VIF0_CHANNEL + 0x20] = 0;
     }
     if (hadVif1)
     {
-        raiseDStatChannel(1u); // VIF1 channel
-        queueCompletedDmacCause(1u);
-        m_ioRegisters[VIF1_CHANNEL + 0x00] &= ~0x100u;
+        completeDmacChannel(VIF1_CHANNEL, 1u); // VIF1 channel
         m_ioRegisters[VIF1_CHANNEL + 0x20] = 0;
     }
 }
@@ -2007,7 +2007,7 @@ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint3
     static constexpr uint32_t D_STAT = 0x1000E010u;
     static constexpr uint32_t D_CTRL = 0x1000E000u;
 
-    if (!m_rdram || !m_gsVRAM || m_path3Masked)
+    if (!m_rdram || !m_gsVRAM || m_path3Masked || m_vif1ExecutionDepth != 0u)
         return false;
     if (m_gifArbiter && !m_gifArbiter->empty())
         return false;
@@ -2199,7 +2199,7 @@ bool PS2Memory::tryProcessNativeGifPackedChain(GS &gs, uint32_t tadr, uint32_t c
     static constexpr uint32_t D_STAT = 0x1000E010u;
     static constexpr uint32_t D_CTRL = 0x1000E000u;
 
-    if (!m_rdram || !m_gsVRAM || m_path3Masked)
+    if (!m_rdram || !m_gsVRAM || m_path3Masked || m_vif1ExecutionDepth != 0u)
         return false;
     if (m_gifArbiter && !m_gifArbiter->empty())
         return false;

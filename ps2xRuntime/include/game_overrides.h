@@ -3618,6 +3618,104 @@ namespace ps2_game_overrides::primal_director_repair
         ctx->pc = 0x002DC0F4u;
     }
 
+    // #110 Missing switch-table case 5 (0x2cb64c) in entry_002cb4b0 (table at 0x004771c0)
+    inline void stub2cb64c(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t s0 = getRegU32(ctx, 16);
+        const uint32_t s1 = getRegU32(ctx, 17);
+        const uint32_t v0 = READ32(ADD32(s0, 8u));
+        const uint32_t bits = READ32(v0);
+        float f = 0.0f;
+        std::memcpy(&f, &bits, sizeof(f));
+        ctx->f[0] = f;
+        const uint32_t nextV0 = ADD32(v0, 4u);
+        SET_GPR_S32(ctx, 2, static_cast<int32_t>(nextV0));
+        WRITE32(ADD32(s0, 8u), nextV0);
+        WRITE32(ADD32(s1, 0x500u), bits);
+        ctx->pc = 0x002CB67Cu;
+    }
+
+    // #110 Missing actor factory entries merged into destructor tails (JALR from 0x2bb188)
+    template <uint32_t EntryAddr, uint32_t ObjSize, uint32_t CtorAddr>
+    inline void primalActorFactoryStub(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(ADD32(GPR_U32(ctx, 29), 0xFFFFFFB0u)));
+        const uint32_t sp = GPR_U32(ctx, 29);
+        const uint32_t allocCtx = READ32(0x00488388u);
+        SET_GPR_S32(ctx, 4, static_cast<int32_t>(allocCtx));
+        WRITE128(ADD32(sp, 48u), GPR_VEC(ctx, 19)); // s3
+        WRITE128(ADD32(sp, 32u), GPR_VEC(ctx, 18)); // s2
+        SET_GPR_U64(ctx, 19, GPR_U64(ctx, 7));      // s3 = a3
+        WRITE128(ADD32(sp, 16u), GPR_VEC(ctx, 17)); // s1
+        SET_GPR_U64(ctx, 18, GPR_U64(ctx, 6));      // s2 = a2
+        WRITE128(ADD32(sp, 64u), GPR_VEC(ctx, 31)); // ra
+        SET_GPR_U64(ctx, 17, GPR_U64(ctx, 5));      // s1 = a1
+        WRITE128(ADD32(sp, 0u), GPR_VEC(ctx, 16));  // s0
+
+        if (allocCtx == 0u)
+        {
+            SET_GPR_U32(ctx, 31, EntryAddr + 0x38u);
+            SET_GPR_S32(ctx, 4, static_cast<int32_t>(ObjSize));
+            ctx->pc = 0x0028A2A0u;
+            if (!runtime->dispatchGuestBranch(rdram, ctx, 0x0028A2A0u, EntryAddr + 0x30u, EntryAddr + 0x38u,
+                                              PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+            {
+                return;
+            }
+            SET_GPR_U64(ctx, 16, GPR_U64(ctx, 2)); // s0 = v0
+        }
+        else
+        {
+            SET_GPR_S32(ctx, 5, static_cast<int32_t>(ObjSize));
+            SET_GPR_U32(ctx, 31, EntryAddr + 0x4Cu);
+            SET_GPR_S32(ctx, 6, 1);
+            ctx->pc = 0x00281FC0u;
+            if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00281FC0u, EntryAddr + 0x44u, EntryAddr + 0x4Cu,
+                                              PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+            {
+                return;
+            }
+            SET_GPR_U64(ctx, 16, GPR_U64(ctx, 2)); // s0 = v0
+        }
+
+        SET_GPR_U64(ctx, 4, GPR_U64(ctx, 16));
+        SET_GPR_S32(ctx, 6, static_cast<int32_t>(ObjSize));
+        SET_GPR_U32(ctx, 31, EntryAddr + 0x60u);
+        SET_GPR_U64(ctx, 5, 0u);
+        ctx->pc = 0x003FCBF0u;
+        if (!runtime->dispatchGuestBranch(rdram, ctx, 0x003FCBF0u, EntryAddr + 0x58u, EntryAddr + 0x60u,
+                                          PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+        {
+            return;
+        }
+
+        const uint32_t ownerPtr = READ32(0x00488388u);
+        SET_GPR_S32(ctx, 3, static_cast<int32_t>(ownerPtr));
+        SET_GPR_U64(ctx, 4, GPR_U64(ctx, 16));
+        SET_GPR_U64(ctx, 5, GPR_U64(ctx, 17));
+        SET_GPR_U32(ctx, 31, EntryAddr + 0x78u);
+        WRITE32(GPR_U32(ctx, 16), ownerPtr);
+        ctx->pc = CtorAddr;
+        if (!runtime->dispatchGuestBranch(rdram, ctx, CtorAddr, EntryAddr + 0x70u, EntryAddr + 0x78u,
+                                          PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+        {
+            return;
+        }
+
+        SET_GPR_U64(ctx, 3, GPR_U64(ctx, 2));
+        const uint32_t curSp = GPR_U32(ctx, 29);
+        SET_GPR_VEC(ctx, 31, READ128(ADD32(curSp, 64u)));
+        WRITE32(ADD32(GPR_U32(ctx, 3), 40u), GPR_U32(ctx, 18));
+        WRITE32(ADD32(GPR_U32(ctx, 3), 8u), GPR_U32(ctx, 19));
+        SET_GPR_VEC(ctx, 19, READ128(ADD32(curSp, 48u)));
+        SET_GPR_VEC(ctx, 18, READ128(ADD32(curSp, 32u)));
+        SET_GPR_VEC(ctx, 17, READ128(ADD32(curSp, 16u)));
+        SET_GPR_VEC(ctx, 16, READ128(ADD32(curSp, 0u)));
+        const uint32_t retPc = GPR_U32(ctx, 31);
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(ADD32(curSp, 80u)));
+        ctx->pc = retPc;
+    }
+
     inline PS2Runtime::RecompiledFunction g_orig379c88 = nullptr;
     inline PS2Runtime::RecompiledFunction g_orig379c8c = nullptr;
     inline void wrap379c88(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -3782,11 +3880,6 @@ namespace ps2_game_overrides::primal_director_repair
             runtime->gs().setDebugHistoryPaused(false);
         }
         if (g_orig298200) g_orig298200(rdram, ctx, runtime);
-        if (runtime && (runtime->memory().vif1_regs.stat & (1u << 11)) != 0u)
-        {
-            runtime->memory().vif1_regs.stat &= ~(1u << 11);
-            runtime->eeScheduler().dispatchIrq(false, 5u);
-        }
         {
             static uint64_t s_lastSeq = 0;
             static uint32_t s_totalXfer = 0;
@@ -8200,6 +8293,12 @@ inline void dumpClusterCounts() {
         runtime.registerFunction(0x002DC050u, &stub2dc050);
         runtime.registerFunction(0x002DC068u, &stub2dc068);
         runtime.registerFunction(0x002DC0CCu, &stub2dc0cc);
+        // #110 Missing switch-table case 5 (0x2cb64c) and 4 actor factories merged into destructor tails
+        runtime.registerFunction(0x002CB64Cu, &stub2cb64c);
+        runtime.registerFunction(0x001449B8u, &primalActorFactoryStub<0x001449B8u, 0x114u, 0x00144540u>);
+        runtime.registerFunction(0x00149560u, &primalActorFactoryStub<0x00149560u, 0x280u, 0x00148350u>);
+        runtime.registerFunction(0x0014D998u, &primalActorFactoryStub<0x0014D998u, 0x370u, 0x0014CF70u>);
+        runtime.registerFunction(0x001A2ED0u, &primalActorFactoryStub<0x001A2ED0u, 0x360u, 0x001A2E08u>);
         for (uint32_t pc1036c8 : {0x001036C8u, 0x0010370Cu, 0x00103714u, 0x00103758u,
                                   0x00103770u, 0x001037A8u, 0x00103804u, 0x00103854u,
                                   0x00103920u, 0x00103938u, 0x00103950u, 0x0010395Cu,

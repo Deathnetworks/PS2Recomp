@@ -863,6 +863,13 @@ bool PS2Runtime::syncCoreSubsystems()
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
                                          (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
+    m_memory.setVif1IrqCallback([this]()
+                                {
+                                    if (m_eeScheduler)
+                                    {
+                                        m_eeScheduler->dispatchIrqSynchronously(false, 5u);
+                                    }
+                                });
     resetIop();
     m_vu0.reset();
     m_vu1.reset();

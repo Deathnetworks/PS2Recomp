@@ -1526,6 +1526,119 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
     }
 }
 
+bool EeScheduler::dispatchIrqSynchronously(bool dmac, uint32_t cause)
+{
+    assertExecutor();
+    const uint32_t mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
+    if (cause < 32u && (mask & (1u << cause)) == 0u)
+    {
+        return false;
+    }
+
+    GuestThread *running = currentThread();
+    if (!running || !m_rdram)
+    {
+        return false;
+    }
+
+    static const bool s_noDiGate = []() {
+        const char *e = std::getenv("PS2_NO_DI_GATE");
+        return e != nullptr && e[0] == '1';
+    }();
+    const bool irqEnabled = s_noDiGate ||
+                            ((running->activeContext().cop0_status & 0x10001u) == 0x10001u);
+    if (!irqEnabled)
+    {
+        dispatchIrq(dmac, cause);
+        return false;
+    }
+
+    const auto &handlers = dmac ? m_dmacHandlers : m_intcHandlers;
+    std::vector<EeIrqHandler> matching;
+    for (const auto &[id, handler] : handlers)
+    {
+        (void)id;
+        if (handler.enabled && handler.cause == cause && handler.handler != 0u &&
+            m_runtime.hasFunction(handler.handler))
+        {
+            matching.push_back(handler);
+        }
+    }
+    if (matching.empty())
+    {
+        return false;
+    }
+
+    std::sort(matching.begin(), matching.end(), [](const EeIrqHandler &left, const EeIrqHandler &right)
+              { return left.order < right.order; });
+
+    for (const EeIrqHandler &handler : matching)
+    {
+        GuestInvocation invocation{};
+        invocation.kind = GuestInvocationKind::Interrupt;
+        invocation.sequence = ++m_invocationSequence;
+        invocation.context.pc = handler.handler;
+        SET_GPR_U32(&invocation.context, 4, cause);
+        SET_GPR_U32(&invocation.context, 5, handler.argument);
+        SET_GPR_U32(&invocation.context, 28, handler.gp);
+        SET_GPR_U32(&invocation.context, 29, handler.sp != 0u ? handler.sp : invocationStackTop());
+        SET_GPR_U32(&invocation.context, 31, 0u);
+
+        running->invocations.push_back(std::move(invocation));
+
+        struct SyncIrqFrameGuard
+        {
+            GuestThread &thread;
+            bool &insideFlag;
+            bool prevInside;
+            SyncIrqFrameGuard(GuestThread &t, bool &flag)
+                : thread(t), insideFlag(flag), prevInside(flag)
+            {
+                insideFlag = true;
+            }
+            ~SyncIrqFrameGuard()
+            {
+                insideFlag = prevInside;
+                if (!thread.invocations.empty())
+                {
+                    thread.invocations.pop_back();
+                }
+            }
+        } frameGuard(*running, m_insideInterrupt);
+
+        constexpr uint32_t kMaxSyncIrqHops = 4096u;
+        for (uint32_t hop = 0u; hop < kMaxSyncIrqHops; ++hop)
+        {
+            R5900Context &irqCtx = running->invocations.back().context;
+            if (irqCtx.pc == 0u || m_stopRequested.load(std::memory_order_acquire))
+            {
+                break;
+            }
+            PS2Runtime::RecompiledFunction fn = m_runtime.lookupFunction(irqCtx.pc);
+            if (!fn)
+            {
+                break;
+            }
+            const uint32_t entryPc = irqCtx.pc;
+            irqCtx.vu0_vf[0] = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);
+            fn(m_rdram, &irqCtx, &m_runtime);
+            irqCtx.vu0_vf[0] = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);
+            if (irqCtx.pc == 0u || irqCtx.pc == entryPc)
+            {
+                break;
+            }
+        }
+
+        const int32_t handlerRet = static_cast<int32_t>(getRegU32(&running->invocations.back().context, 2));
+        if (handlerRet < 0)
+        {
+            break;
+        }
+    }
+
+    return true;
+}
+
 void EeScheduler::setVSyncFlag(uint32_t flagAddress, uint32_t tickAddress)
 {
     assertExecutor();

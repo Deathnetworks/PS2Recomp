@@ -312,6 +312,13 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
     if (sizeBytes == 0u)
         return;
 
+    struct Vif1DepthGuard
+    {
+        uint32_t &depth;
+        explicit Vif1DepthGuard(uint32_t &d) : depth(d) { ++depth; }
+        ~Vif1DepthGuard() { --depth; }
+    } depthGuard(m_vif1ExecutionDepth);
+
     Vif1TruncatedDirectState truncatedState{};
     {
         std::lock_guard<std::mutex> lock(s_vif1DirectMutex);
@@ -403,13 +410,26 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         uint8_t opcode = (cmd >> 24) & 0x7F;
         uint16_t imm = cmd & 0xFFFF;
         uint8_t num = (cmd >> 16) & 0xFF;
-        const bool irq = (cmd & 0x80000000u) != 0u;
+        bool pendingIrq = ((cmd & 0x80000000u) != 0u) && ((vif1_regs.err & 0x1u) == 0u);
 
         // Track most-recent command for VIFn_CODE emulation.
         vif1_regs.code = cmd;
         vif1_regs.num = num;
-        if (irq)
+        if (pendingIrq)
             vif1_regs.stat |= (1u << 11); // INT
+
+        struct Vif1IrqGuard
+        {
+            PS2Memory &mem;
+            bool &fire;
+            ~Vif1IrqGuard()
+            {
+                if (fire && mem.m_vif1IrqCallback)
+                {
+                    mem.m_vif1IrqCallback();
+                }
+            }
+        } irqGuard{*this, pendingIrq};
 
         if (opcode == VIF_NOP)
         {
@@ -461,8 +481,19 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             vif1_regs.stat |= (1u << 6); // MRK
             continue;
         }
-        else if (opcode == VIF_FLUSHE || opcode == VIF_FLUSH || opcode == VIF_FLUSHA)
+        else if (opcode == VIF_FLUSHE)
         {
+            continue;
+        }
+        else if (opcode == VIF_FLUSH)
+        {
+            if (m_gifArbiter)
+                m_gifArbiter->drain();
+            continue;
+        }
+        else if (opcode == VIF_FLUSHA)
+        {
+            drainPendingGifTransfers();
             continue;
         }
         else if (opcode == VIF_MSCAL || opcode == VIF_MSCALF)
@@ -566,6 +597,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 truncatedState.remainingQw = requestedQw - qwCount;
                 truncatedState.directHl = directHl;
                 pos = sizeBytes;
+                pendingIrq = false;
                 break;
             }
             continue;
