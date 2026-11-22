@@ -1,6 +1,9 @@
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
+#include <algorithm>
 #include <cstring>
+#include <mutex>
+#include <unordered_map>
 
 enum VIFCmd : uint8_t
 {
@@ -29,6 +32,15 @@ enum VIFCmd : uint8_t
 namespace
 {
     constexpr uint8_t kGifFmtImage = 2u;
+
+    struct Vif1TruncatedDirectState
+    {
+        uint32_t remainingQw = 0u;
+        bool directHl = false;
+    };
+
+    std::mutex s_vif1DirectMutex;
+    std::unordered_map<const PS2Memory *, Vif1TruncatedDirectState> s_vif1TruncatedDirect;
 
     uint32_t pendingGifImageQwc(const uint8_t *data, uint32_t sizeBytes)
     {
@@ -300,11 +312,71 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
     if (sizeBytes == 0u)
         return;
 
+    Vif1TruncatedDirectState truncatedState{};
+    {
+        std::lock_guard<std::mutex> lock(s_vif1DirectMutex);
+        auto it = s_vif1TruncatedDirect.find(this);
+        if (it != s_vif1TruncatedDirect.end())
+        {
+            truncatedState = it->second;
+        }
+    }
+    if (vif1_regs.code == 0u && m_vif1PendingPath2ImageQwc == 0u)
+    {
+        truncatedState = {};
+    }
+
+    auto forwardDirectPayload = [&](const uint8_t *payload, uint32_t qwCount, bool directHl)
+    {
+        if (qwCount == 0u)
+            return;
+
+        uint32_t consumedQw = 0u;
+        if (m_vif1PendingPath2ImageQwc != 0u)
+        {
+            const uint32_t imgQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, qwCount);
+            const bool path2Hl = m_vif1PendingPath2DirectHl || directHl;
+            while (consumedQw < imgQw)
+            {
+                const uint32_t subQw = std::min<uint32_t>(imgQw - consumedQw, 0x7FFFu);
+                std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(subQw) * 16u, 0u);
+                const uint64_t imageTag =
+                    static_cast<uint64_t>(subQw & 0x7FFFu) |
+                    ((m_vif1PendingPath2ImageQwc == subQw) ? (1ull << 15) : 0ull) |
+                    (static_cast<uint64_t>(kGifFmtImage) << 58);
+                std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
+                std::memcpy(imagePacket.data() + 16u, payload + static_cast<size_t>(consumedQw) * 16u, static_cast<size_t>(subQw) * 16u);
+                submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true, path2Hl);
+
+                m_vif1PendingPath2ImageQwc -= subQw;
+                consumedQw += subQw;
+            }
+            if (m_vif1PendingPath2ImageQwc == 0u)
+            {
+                m_vif1PendingPath2DirectHl = false;
+            }
+        }
+
+        if (consumedQw < qwCount)
+        {
+            const uint32_t remQw = qwCount - consumedQw;
+            const uint8_t *remPtr = payload + static_cast<size_t>(consumedQw) * 16u;
+            submitGifPacket(GifPathId::Path2, remPtr, remQw * 16u, true, directHl);
+
+            const uint32_t pendingImageQw = pendingGifImageQwc(remPtr, remQw * 16u);
+            if (pendingImageQw != 0u)
+            {
+                m_vif1PendingPath2ImageQwc = pendingImageQw;
+                m_vif1PendingPath2DirectHl = directHl;
+            }
+        }
+    };
+
     uint32_t pos = 0;
 
     while (pos + 4 <= sizeBytes)
     {
-        if (m_vif1PendingPath2ImageQwc != 0u)
+        if (truncatedState.remainingQw != 0u)
         {
             const uint32_t availableQw = (sizeBytes - pos) / 16u;
             if (availableQw == 0u)
@@ -312,21 +384,14 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 break;
             }
 
-            const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, availableQw);
-            std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
-            const uint64_t imageTag =
-                static_cast<uint64_t>(chunkQw & 0x7FFFu) |
-                ((m_vif1PendingPath2ImageQwc == chunkQw) ? (1ull << 15) : 0ull) |
-                (static_cast<uint64_t>(kGifFmtImage) << 58);
-            std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
-            std::memcpy(imagePacket.data() + 16u, data + pos, static_cast<size_t>(chunkQw) * 16u);
-            submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true, m_vif1PendingPath2DirectHl);
+            const uint32_t chunkQw = std::min<uint32_t>(truncatedState.remainingQw, availableQw);
+            forwardDirectPayload(data + pos, chunkQw, truncatedState.directHl);
 
             pos += chunkQw * 16u;
-            m_vif1PendingPath2ImageQwc -= chunkQw;
-            if (m_vif1PendingPath2ImageQwc == 0u)
+            truncatedState.remainingQw -= chunkQw;
+            if (truncatedState.remainingQw == 0u)
             {
-                m_vif1PendingPath2DirectHl = false;
+                truncatedState.directHl = false;
             }
             continue;
         }
@@ -487,30 +552,19 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         }
         else if (opcode == VIF_DIRECT || opcode == VIF_DIRECTHL)
         {
-            uint32_t qwCount = imm;
-            if (qwCount == 0)
-                qwCount = 65536;
+            const uint32_t requestedQw = (imm == 0u) ? 65536u : static_cast<uint32_t>(imm);
             const uint32_t availableQw = (sizeBytes - pos) / 16u;
-            const bool truncated = qwCount > availableQw;
-            if (qwCount > availableQw)
-                qwCount = availableQw;
+            const bool truncated = requestedQw > availableQw;
+            const uint32_t qwCount = truncated ? availableQw : requestedQw;
+            const bool directHl = (opcode == VIF_DIRECTHL);
 
-            if (qwCount > 0)
-            {
-                const bool directHl = (opcode == VIF_DIRECTHL);
-                submitGifPacket(GifPathId::Path2, data + pos, qwCount * 16, true, directHl);
+            forwardDirectPayload(data + pos, qwCount, directHl);
 
-                const uint32_t pendingImageQw = pendingGifImageQwc(data + pos, qwCount * 16u);
-                if (pendingImageQw != 0u)
-                {
-                    m_vif1PendingPath2ImageQwc = pendingImageQw;
-                    m_vif1PendingPath2DirectHl = directHl;
-                }
-            }
-
-            pos += qwCount * 16;
+            pos += qwCount * 16u;
             if (truncated)
             {
+                truncatedState.remainingQw = requestedQw - qwCount;
+                truncatedState.directHl = directHl;
                 pos = sizeBytes;
                 break;
             }
@@ -778,6 +832,18 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         else
         {
             continue;
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(s_vif1DirectMutex);
+        if (truncatedState.remainingQw != 0u)
+        {
+            s_vif1TruncatedDirect[this] = truncatedState;
+        }
+        else
+        {
+            s_vif1TruncatedDirect.erase(this);
         }
     }
 }

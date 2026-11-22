@@ -8,11 +8,20 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <deque>
 #include <filesystem>
 #include <mutex>
 #include <string>
 #include <string_view>
 #include <vector>
+#if defined(PS2X_HAS_FFMPEG) && PS2X_HAS_FFMPEG
+extern "C"
+{
+#include <libavcodec/avcodec.h>
+#include <libavutil/log.h>
+#include <libswscale/swscale.h>
+}
+#endif
 #if !defined(_WIN32)
 #include <execinfo.h>
 #include <sys/mman.h>
@@ -1439,9 +1448,15 @@ namespace ps2_game_overrides::primal_private_iop_rpc
         return image;
     }
 
+    inline uint32_t &streamBaseLba()
+    {
+        static uint32_t s_baseLba = 0u;
+        return s_baseLba;
+    }
+
     inline void serveStreamRequest(uint8_t *rdram, uint32_t client, uint32_t function)
     {
-        static uint32_t baseLba = 0u;
+        uint32_t &baseLba = streamBaseLba();
         static uint32_t logged = 0u;
         uint32_t replyPointer = 0u;
         if (!primal_sif_rpc::readGuestU32(rdram, client + kClientReplyPointerOffset, replyPointer) ||
@@ -1494,9 +1509,9 @@ namespace ps2_game_overrides::primal_private_iop_rpc
         (void)primal_sif_rpc::writeGuestU32(rdram, replyPointer + 4u, transferred);
     }
 
-    inline void serveStream1003Request(uint8_t *rdram, uint32_t client, uint32_t parameter)
+    inline void serveStream1003Request(uint8_t *rdram, uint32_t client, uint32_t function, uint32_t parameter)
     {
-        if (parameter != 1u)
+        if (function != 0u)
             return;
         uint32_t replyPointer = 0u;
         if (!primal_sif_rpc::readGuestU32(rdram, client + kClientReplyPointerOffset, replyPointer) ||
@@ -1507,6 +1522,7 @@ namespace ps2_game_overrides::primal_private_iop_rpc
         (void)primal_sif_rpc::readGuestU32(rdram, replyPointer + 4u, count);
         (void)primal_sif_rpc::readGuestU32(rdram, client + 0x08u, sendPointer);
 
+        const uint32_t absLba = streamBaseLba() + lba;
         uint32_t transferred = 0u;
         std::ifstream &image = streamCdImage();
         uint8_t *host = nullptr;
@@ -1516,7 +1532,7 @@ namespace ps2_game_overrides::primal_private_iop_rpc
         {
             const uint32_t want = (count < available) ? count : available;
             image.clear();
-            image.seekg(static_cast<std::streamoff>(lba) * 2048, std::ios::beg);
+            image.seekg(static_cast<std::streamoff>(absLba) * 2048, std::ios::beg);
             image.read(reinterpret_cast<char *>(host), want);
             transferred = static_cast<uint32_t>(image.gcount());
         }
@@ -1524,9 +1540,11 @@ namespace ps2_game_overrides::primal_private_iop_rpc
         if (logged1003 < 16u)
         {
             ++logged1003;
-            RUNTIME_LOG("[game_overrides] stream1003 read lba=0x" << std::hex << lba
-                        << std::dec << " want=" << count << " got=" << transferred
-                        << " dst=0x" << std::hex << sendPointer << std::dec << std::endl);
+            RUNTIME_LOG("[game_overrides] stream1003 read rel=0x" << std::hex << lba
+                        << std::dec << " abs=" << absLba
+                        << " want=" << count << " got=" << transferred
+                        << " dst=0x" << std::hex << sendPointer << std::dec
+                        << " sync=" << (parameter == 0u ? 1 : 0) << std::endl);
         }
         (void)primal_sif_rpc::writeGuestU32(rdram, replyPointer + 4u, transferred);
     }
@@ -1608,7 +1626,7 @@ namespace ps2_game_overrides::primal_private_iop_rpc
         }
         else if (sid == 0x1003u)
         {
-            serveStream1003Request(rdram, client, parameter);
+            serveStream1003Request(rdram, client, function, parameter);
         }
 
         // The retail request wrapper (0x330D00) clears client+0x3C before issuing and the
@@ -3489,8 +3507,12 @@ namespace ps2_game_overrides::primal_director_repair
             uint8_t *p = nullptr; uint32_t av = 0;
             return (primal_sif_rpc::mapGuestRange(rdram, addr, p, av) && av >= 4) ? *(uint32_t*)p : 0xDEADu;
         };
+        static const bool s_skipFmv = [] {
+            const char *e = std::getenv("PS2_SKIP_FMV");
+            return e != nullptr && e[0] == '1';
+        }();
         const uint32_t before = rd5d8c();
-        if (before == 3u || before == 6u)
+        if (s_skipFmv && (before == 3u || before == 6u))
         {
             const uint32_t stateAddr = ADD32(GPR_U32(ctx, 28), 0xFFFFA274u);
             uint8_t *sp = nullptr;
@@ -7410,6 +7432,611 @@ inline void dumpClusterCounts() {
         }
     }
 
+    namespace primal_mpeg_hle
+    {
+        struct DecodedFrame
+        {
+            int width = 0;
+            int height = 0;
+            std::vector<uint8_t> rgba;
+        };
+
+        struct PrimalMpegState
+        {
+            static constexpr size_t kMaxBufferedFrames = 8u;
+
+            std::mutex mtx;
+            std::deque<DecodedFrame> frames;
+            DecodedFrame lastFrame;
+            std::vector<uint8_t> esBuf;
+            bool sawProgramEnd = false;
+            uint32_t frameCount = 0u;
+
+#if defined(PS2X_HAS_FFMPEG) && PS2X_HAS_FFMPEG
+            AVCodecContext *codecCtx = nullptr;
+            AVCodecParserContext *parserCtx = nullptr;
+            AVFrame *avFrame = nullptr;
+            AVPacket *avPkt = nullptr;
+            SwsContext *swsCtx = nullptr;
+
+            void destroyLocked()
+            {
+                if (swsCtx != nullptr)
+                {
+                    sws_freeContext(swsCtx);
+                    swsCtx = nullptr;
+                }
+                av_packet_free(&avPkt);
+                av_frame_free(&avFrame);
+                if (parserCtx != nullptr)
+                {
+                    av_parser_close(parserCtx);
+                    parserCtx = nullptr;
+                }
+                avcodec_free_context(&codecCtx);
+                frames.clear();
+                lastFrame = {};
+                esBuf.clear();
+                sawProgramEnd = false;
+                frameCount = 0u;
+            }
+
+            void initDecoderLocked()
+            {
+                destroyLocked();
+                av_log_set_level(AV_LOG_ERROR);
+
+                const AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_MPEG2VIDEO);
+                if (codec == nullptr)
+                {
+                    RUNTIME_LOG("[primal-mpeg] ERROR: AV_CODEC_ID_MPEG2VIDEO decoder not found" << std::endl);
+                    return;
+                }
+
+                codecCtx = avcodec_alloc_context3(codec);
+                if (codecCtx == nullptr)
+                {
+                    destroyLocked();
+                    return;
+                }
+                codecCtx->thread_count = 1;
+
+                if (avcodec_open2(codecCtx, codec, nullptr) < 0)
+                {
+                    RUNTIME_LOG("[primal-mpeg] ERROR: avcodec_open2 failed" << std::endl);
+                    destroyLocked();
+                    return;
+                }
+
+                parserCtx = av_parser_init(AV_CODEC_ID_MPEG2VIDEO);
+                avFrame = av_frame_alloc();
+                avPkt = av_packet_alloc();
+                if (parserCtx == nullptr || avFrame == nullptr || avPkt == nullptr)
+                {
+                    RUNTIME_LOG("[primal-mpeg] ERROR: parser/frame/packet alloc failed" << std::endl);
+                    destroyLocked();
+                }
+            }
+
+            void drainFramesLocked()
+            {
+                if (codecCtx == nullptr || avFrame == nullptr)
+                    return;
+
+                while (avcodec_receive_frame(codecCtx, avFrame) == 0)
+                {
+                    if (avFrame->width > 0 && avFrame->height > 0)
+                    {
+                        swsCtx = sws_getCachedContext(
+                            swsCtx,
+                            avFrame->width,
+                            avFrame->height,
+                            static_cast<AVPixelFormat>(avFrame->format),
+                            avFrame->width,
+                            avFrame->height,
+                            AV_PIX_FMT_RGBA,
+                            SWS_BILINEAR,
+                            nullptr,
+                            nullptr,
+                            nullptr);
+                        if (swsCtx != nullptr)
+                        {
+                            DecodedFrame df;
+                            df.width = avFrame->width;
+                            df.height = avFrame->height;
+                            const size_t pxCount = static_cast<size_t>(df.width) * static_cast<size_t>(df.height);
+                            df.rgba.resize(pxCount * 4u);
+
+                            uint8_t *dstSlices[4] = {df.rgba.data(), nullptr, nullptr, nullptr};
+                            int dstLinesize[4] = {df.width * 4, 0, 0, 0};
+                            sws_scale(swsCtx, avFrame->data, avFrame->linesize, 0, df.height, dstSlices, dstLinesize);
+
+                            // Sony libmpeg RGBA32 sets A=0x80 (GS 1.0 alpha scale).
+                            for (size_t i = 0; i < pxCount; ++i)
+                            {
+                                df.rgba[i * 4u + 3u] = 0x80u;
+                            }
+                            frames.push_back(std::move(df));
+                        }
+                    }
+                    av_frame_unref(avFrame);
+                }
+            }
+
+            void decodeVideoBytesLocked(const uint8_t *data, size_t size)
+            {
+                if (codecCtx == nullptr || parserCtx == nullptr || avPkt == nullptr || data == nullptr || size == 0u)
+                    return;
+
+                size_t offset = 0u;
+                while (offset < size)
+                {
+                    uint8_t *pktData = nullptr;
+                    int pktSize = 0;
+                    const int used = av_parser_parse2(
+                        parserCtx,
+                        codecCtx,
+                        &pktData,
+                        &pktSize,
+                        data + offset,
+                        static_cast<int>(size - offset),
+                        AV_NOPTS_VALUE,
+                        AV_NOPTS_VALUE,
+                        0);
+                    if (used < 0)
+                        break;
+                    offset += static_cast<size_t>(used);
+
+                    if (pktSize > 0 && pktData != nullptr)
+                    {
+                        avPkt->data = pktData;
+                        avPkt->size = pktSize;
+                        const int sendErr = avcodec_send_packet(codecCtx, avPkt);
+                        avPkt->data = nullptr;
+                        avPkt->size = 0;
+                        if (sendErr == 0)
+                        {
+                            drainFramesLocked();
+                        }
+                    }
+                }
+            }
+
+            void flushEndOfStreamLocked()
+            {
+                if (codecCtx != nullptr && parserCtx != nullptr && avPkt != nullptr)
+                {
+                    uint8_t *pktData = nullptr;
+                    int pktSize = 0;
+                    av_parser_parse2(parserCtx, codecCtx, &pktData, &pktSize, nullptr, 0, AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
+                    if (pktSize > 0 && pktData != nullptr)
+                    {
+                        avPkt->data = pktData;
+                        avPkt->size = pktSize;
+                        const int sendErr = avcodec_send_packet(codecCtx, avPkt);
+                        avPkt->data = nullptr;
+                        avPkt->size = 0;
+                        if (sendErr == 0)
+                        {
+                            drainFramesLocked();
+                        }
+                    }
+                    avcodec_send_packet(codecCtx, nullptr);
+                    drainFramesLocked();
+                    avcodec_flush_buffers(codecCtx);
+                }
+                if (parserCtx != nullptr)
+                {
+                    av_parser_close(parserCtx);
+                    parserCtx = av_parser_init(AV_CODEC_ID_MPEG2VIDEO);
+                }
+                sawProgramEnd = true;
+            }
+
+            void resetStreamLocked()
+            {
+                if (codecCtx != nullptr)
+                {
+                    avcodec_flush_buffers(codecCtx);
+                }
+                if (parserCtx != nullptr)
+                {
+                    av_parser_close(parserCtx);
+                    parserCtx = av_parser_init(AV_CODEC_ID_MPEG2VIDEO);
+                }
+                frames.clear();
+                lastFrame = {};
+                esBuf.clear();
+                sawProgramEnd = false;
+                frameCount = 0u;
+            }
+#else
+            void destroyLocked()
+            {
+                frames.clear();
+                lastFrame = {};
+                esBuf.clear();
+                sawProgramEnd = false;
+                frameCount = 0u;
+            }
+            void initDecoderLocked() { destroyLocked(); }
+            void decodeVideoBytesLocked(const uint8_t *, size_t) {}
+            void flushEndOfStreamLocked() { sawProgramEnd = true; }
+            void resetStreamLocked() { destroyLocked(); }
+#endif
+        };
+
+        inline PrimalMpegState &mpegState()
+        {
+            static PrimalMpegState s;
+            return s;
+        }
+
+        inline void sceMpegInitHle(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            (void)rdram;
+            (void)runtime;
+            PrimalMpegState &state = mpegState();
+            std::lock_guard<std::mutex> lock(state.mtx);
+            state.destroyLocked();
+            SET_GPR_S32(ctx, 2, 0);
+            ctx->pc = getRegU32(ctx, 31);
+        }
+
+        inline void sceMpegCreateHle(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            (void)runtime;
+            const uint32_t mp = getRegU32(ctx, 4);
+            const uint32_t workBuf = getRegU32(ctx, 5);
+            const uint32_t workSize = getRegU32(ctx, 6);
+            (void)workSize;
+
+            if (mp == 0u || workBuf == 0u)
+            {
+                RUNTIME_LOG("[primal-mpeg] blocked null sceMpegCreate mp=0x" << std::hex << mp
+                            << " work_buf=0x" << workBuf << std::dec << std::endl);
+                SET_GPR_U32(ctx, 2, 0u);
+                ctx->pc = getRegU32(ctx, 31);
+                return;
+            }
+
+            uint8_t *mpHost = nullptr;
+            uint32_t mpAvail = 0u;
+            if (primal_sif_rpc::mapGuestRange(rdram, mp, mpHost, mpAvail) && mpAvail >= 0x48u)
+            {
+                std::memset(mpHost, 0, 0x48u);
+                (void)primal_sif_rpc::writeGuestU32(rdram, mp + 0x40u, (workBuf + 3u) & ~3u);
+                for (uint32_t off = 0x10u; off < 0x40u; off += 4u)
+                {
+                    (void)primal_sif_rpc::writeGuestU32(rdram, mp + off, 0xFFFFFFFFu);
+                }
+            }
+
+            PrimalMpegState &state = mpegState();
+            {
+                std::lock_guard<std::mutex> lock(state.mtx);
+                state.initDecoderLocked();
+            }
+
+            SET_GPR_U32(ctx, 2, mp);
+            ctx->pc = getRegU32(ctx, 31);
+        }
+
+        inline void sceMpegAddCallbackHle(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            (void)rdram;
+            (void)runtime;
+            SET_GPR_S32(ctx, 2, 0);
+            ctx->pc = getRegU32(ctx, 31);
+        }
+
+        inline void sceMpegAddStrCallbackHle(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            (void)rdram;
+            (void)runtime;
+            SET_GPR_S32(ctx, 2, 0);
+            ctx->pc = getRegU32(ctx, 31);
+        }
+
+        inline void sceMpegDemuxPssRingHle(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            (void)runtime;
+            const uint32_t readPtr = getRegU32(ctx, 5);
+            const uint32_t availBytes = getRegU32(ctx, 6);
+            const uint32_t ringBase = getRegU32(ctx, 7);
+            const uint32_t ringSize = getRegU32(ctx, 8);
+
+            if (availBytes == 0u || ringSize < 16u)
+            {
+                SET_GPR_S32(ctx, 2, 0);
+                ctx->pc = getRegU32(ctx, 31);
+                return;
+            }
+
+            const uint32_t physRead = readPtr & 0x1FFFFFFFu;
+            const uint32_t physBase = ringBase & 0x1FFFFFFFu;
+            uint8_t *ringPtr = nullptr;
+            uint32_t ringAvail = 0u;
+            if (!primal_sif_rpc::mapGuestRange(rdram, physBase, ringPtr, ringAvail) ||
+                ringPtr == nullptr ||
+                ringAvail < ringSize ||
+                physRead < physBase ||
+                physRead >= physBase + ringSize)
+            {
+                SET_GPR_S32(ctx, 2, 0);
+                ctx->pc = getRegU32(ctx, 31);
+                return;
+            }
+
+            const uint32_t readOff = physRead - physBase;
+            auto ringU8 = [&](uint32_t offset) -> uint8_t
+            {
+                return ringPtr[(readOff + offset) % ringSize];
+            };
+            auto ringCopy = [&](uint32_t offset, uint8_t *dst, uint32_t len)
+            {
+                const uint32_t start = (readOff + offset) % ringSize;
+                const uint32_t first = std::min<uint32_t>(len, ringSize - start);
+                std::memcpy(dst, ringPtr + start, first);
+                if (first < len)
+                {
+                    std::memcpy(dst + first, ringPtr, len - first);
+                }
+            };
+
+            PrimalMpegState &state = mpegState();
+            std::lock_guard<std::mutex> lock(state.mtx);
+
+            if (state.frames.size() >= PrimalMpegState::kMaxBufferedFrames)
+            {
+                SET_GPR_S32(ctx, 2, 0);
+                ctx->pc = getRegU32(ctx, 31);
+                return;
+            }
+
+            uint32_t pos = 0u;
+            while (pos + 4u <= availBytes && state.frames.size() < PrimalMpegState::kMaxBufferedFrames)
+            {
+                if (ringU8(pos) != 0x00u || ringU8(pos + 1u) != 0x00u || ringU8(pos + 2u) != 0x01u)
+                {
+                    ++pos;
+                    continue;
+                }
+
+                const uint8_t code = ringU8(pos + 3u);
+                if (code == 0xB9u) // MPEG_program_end_code
+                {
+                    // Stop BEFORE consuming 00 00 01 B9 so FUN_0032ba90's exact readPtr == *(0x4882B4) loop switch fires.
+                    if (!state.sawProgramEnd)
+                    {
+                        state.flushEndOfStreamLocked();
+                    }
+                    break;
+                }
+                if (code == 0xBAu) // pack_start_code
+                {
+                    if (pos + 12u > availBytes)
+                        break;
+                    if ((ringU8(pos + 4u) & 0xC0u) == 0x40u)
+                    {
+                        if (pos + 14u > availBytes)
+                            break;
+                        const uint32_t hdrLen = 14u + static_cast<uint32_t>(ringU8(pos + 13u) & 0x07u);
+                        if (pos + hdrLen > availBytes)
+                            break;
+                        state.sawProgramEnd = false;
+                        pos += hdrLen;
+                    }
+                    else
+                    {
+                        state.sawProgramEnd = false;
+                        pos += 12u;
+                    }
+                    continue;
+                }
+                if (code >= 0xBBu) // system header / PES packets
+                {
+                    if (pos + 6u > availBytes)
+                        break;
+                    const uint32_t pesLen = (static_cast<uint32_t>(ringU8(pos + 4u)) << 8) | static_cast<uint32_t>(ringU8(pos + 5u));
+                    const uint32_t pktTotal = 6u + pesLen;
+                    if (pos + pktTotal > availBytes)
+                        break;
+
+                    if (code >= 0xE0u && code <= 0xEFu) // MPEG video ES
+                    {
+                        state.sawProgramEnd = false;
+                        uint32_t payloadOff = 6u;
+                        if (pesLen >= 3u && (ringU8(pos + 6u) & 0xC0u) == 0x80u)
+                        {
+                            payloadOff = 9u + static_cast<uint32_t>(ringU8(pos + 8u));
+                        }
+                        else if (pesLen >= 1u)
+                        {
+                            while (payloadOff < pktTotal && ringU8(pos + payloadOff) == 0xFFu)
+                            {
+                                ++payloadOff;
+                            }
+                            if (payloadOff + 2u <= pktTotal && (ringU8(pos + payloadOff) & 0xC0u) == 0x40u)
+                            {
+                                payloadOff += 2u;
+                            }
+                            if (payloadOff < pktTotal)
+                            {
+                                const uint8_t tsFlags = ringU8(pos + payloadOff);
+                                if ((tsFlags & 0xF0u) == 0x20u)
+                                    payloadOff += 5u;
+                                else if ((tsFlags & 0xF0u) == 0x30u)
+                                    payloadOff += 10u;
+                                else if (tsFlags == 0x0Fu)
+                                    payloadOff += 1u;
+                            }
+                        }
+
+                        if (payloadOff < pktTotal)
+                        {
+                            const uint32_t esLen = pktTotal - payloadOff;
+                            state.esBuf.resize(esLen);
+                            ringCopy(pos + payloadOff, state.esBuf.data(), esLen);
+                            state.decodeVideoBytesLocked(state.esBuf.data(), esLen);
+                        }
+                    }
+
+                    pos += pktTotal;
+                    continue;
+                }
+
+                ++pos;
+            }
+
+            SET_GPR_S32(ctx, 2, static_cast<int32_t>(pos));
+            ctx->pc = getRegU32(ctx, 31);
+        }
+
+        inline void sceMpegGetPictureHle(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            (void)runtime;
+            const uint32_t mp = getRegU32(ctx, 4);
+            const uint32_t rgb32Dst = getRegU32(ctx, 5);
+            const uint32_t gp = getRegU32(ctx, 28);
+
+            uint32_t guestW = 0u, guestH = 0u, mbx = 0u, mby = 0u;
+            (void)primal_sif_rpc::readGuestU32(rdram, ADD32(gp, 0xFFFFA254u), guestW);
+            (void)primal_sif_rpc::readGuestU32(rdram, ADD32(gp, 0xFFFFA258u), guestH);
+            (void)primal_sif_rpc::readGuestU32(rdram, ADD32(gp, 0xFFFFA25Cu), mbx);
+            (void)primal_sif_rpc::readGuestU32(rdram, ADD32(gp, 0xFFFFA260u), mby);
+
+            if (mbx == 0u || mbx > 64u)
+                mbx = (guestW > 0u && guestW <= 1024u) ? ((guestW + 15u) / 16u) : 40u;
+            if (mby == 0u || mby > 64u)
+                mby = (guestH > 0u && guestH <= 1024u) ? ((guestH + 15u) / 16u) : 28u;
+
+            const uint32_t dstW = mbx * 16u;
+            const uint32_t dstH = (guestH > 0u && guestH <= mby * 16u) ? guestH : (mby * 16u);
+            const uint32_t stripBytes = 16u * dstH * 4u;
+            const uint32_t totalBytes = mbx * stripBytes;
+
+            uint8_t *dstPtr = nullptr;
+            uint32_t dstAvail = 0u;
+            const bool dstMapped = (rgb32Dst != 0u) && primal_sif_rpc::mapGuestRange(rdram, rgb32Dst, dstPtr, dstAvail);
+
+            PrimalMpegState &state = mpegState();
+            std::lock_guard<std::mutex> lock(state.mtx);
+
+            if (!state.frames.empty())
+            {
+                state.lastFrame = std::move(state.frames.front());
+                state.frames.pop_front();
+                ++state.frameCount;
+            }
+
+            if (dstMapped && dstPtr != nullptr && dstAvail >= totalBytes)
+            {
+                if (!state.lastFrame.rgba.empty() && state.lastFrame.width > 0 && state.lastFrame.height > 0)
+                {
+                    const uint32_t srcW = static_cast<uint32_t>(state.lastFrame.width);
+                    const uint32_t srcH = static_cast<uint32_t>(state.lastFrame.height);
+                    const uint8_t *srcBase = state.lastFrame.rgba.data();
+                    for (uint32_t sx = 0u; sx < mbx; ++sx)
+                    {
+                        const uint32_t srcX = sx * 16u;
+                        uint8_t *stripDst = dstPtr + static_cast<size_t>(sx) * stripBytes;
+                        for (uint32_t y = 0u; y < dstH; ++y)
+                        {
+                            uint8_t *dstRow = stripDst + static_cast<size_t>(y) * 64u;
+                            if (y < srcH && srcX < srcW)
+                            {
+                                const uint32_t copyPx = std::min<uint32_t>(16u, srcW - srcX);
+                                const uint32_t copyBytes = copyPx * 4u;
+                                std::memcpy(dstRow, srcBase + (static_cast<size_t>(y) * srcW + srcX) * 4u, copyBytes);
+                                if (copyBytes < 64u)
+                                {
+                                    std::memset(dstRow + copyBytes, 0, 64u - copyBytes);
+                                }
+                            }
+                            else
+                            {
+                                std::memset(dstRow, 0, 64u);
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    std::memset(dstPtr, 0, totalBytes);
+                }
+            }
+
+            if (mp != 0u)
+            {
+                (void)primal_sif_rpc::writeGuestU32(rdram, mp + 0x00u, dstW);
+                (void)primal_sif_rpc::writeGuestU32(rdram, mp + 0x04u, dstH);
+                (void)primal_sif_rpc::writeGuestU32(rdram, mp + 0x08u, state.frameCount);
+            }
+
+            SET_GPR_S32(ctx, 2, 0);
+            ctx->pc = getRegU32(ctx, 31);
+        }
+
+        inline void sceMpegIsEndHle(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            (void)rdram;
+            (void)runtime;
+            PrimalMpegState &state = mpegState();
+            std::lock_guard<std::mutex> lock(state.mtx);
+            const int32_t ended = (state.sawProgramEnd && state.frames.empty()) ? 1 : 0;
+            SET_GPR_S32(ctx, 2, ended);
+            ctx->pc = getRegU32(ctx, 31);
+        }
+
+        inline void sceMpegResetHle(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            (void)rdram;
+            (void)runtime;
+            PrimalMpegState &state = mpegState();
+            std::lock_guard<std::mutex> lock(state.mtx);
+            state.resetStreamLocked();
+            SET_GPR_S32(ctx, 2, 0);
+            ctx->pc = getRegU32(ctx, 31);
+        }
+
+        inline void sceMpegDeleteHle(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            (void)rdram;
+            (void)runtime;
+            PrimalMpegState &state = mpegState();
+            std::lock_guard<std::mutex> lock(state.mtx);
+            state.destroyLocked();
+            SET_GPR_S32(ctx, 2, 1);
+            ctx->pc = getRegU32(ctx, 31);
+        }
+
+        inline void install(PS2Runtime &runtime)
+        {
+            auto bindHle = [&](uint32_t addr, PS2Runtime::RecompiledFunction fn)
+            {
+                if (runtime.hasFunction(addr))
+                    runtime.replaceFunction(addr, fn);
+                else
+                    runtime.registerFunction(addr, fn);
+            };
+            bindHle(0x003EBD70u, &sceMpegInitHle);
+            bindHle(0x003EBE18u, &sceMpegCreateHle);
+            bindHle(0x003EC140u, &sceMpegAddCallbackHle);
+            bindHle(0x003EB508u, &sceMpegAddStrCallbackHle);
+            bindHle(0x003EB210u, &sceMpegDemuxPssRingHle);
+            bindHle(0x003EC030u, &sceMpegGetPictureHle);
+            bindHle(0x003EC088u, &sceMpegIsEndHle);
+            bindHle(0x003EC098u, &sceMpegResetHle);
+            bindHle(0x003EC020u, &sceMpegDeleteHle);
+#if defined(PS2X_HAS_FFMPEG) && PS2X_HAS_FFMPEG
+            RUNTIME_LOG("[primal-mpeg] HLE installed (FFmpeg=1)" << std::endl);
+#else
+            RUNTIME_LOG("[primal-mpeg] HLE installed (FFmpeg=0)" << std::endl);
+#endif
+        }
+    }
+
     inline void applyPrimalDirectorRepair(PS2Runtime &runtime)
     {
         const char *e = std::getenv("PS2_DISABLE_DIRECTOR_REPAIR");
@@ -7463,7 +8090,8 @@ inline void dumpClusterCounts() {
         ok = SplitChainBridge<0x0032CD00u, 0x0032D270u>::install(runtime) && ok;
         g_orig32cd00b = runtime.lookupFunction(0x0032CD00u);
         if (g_orig32cd00b) runtime.replaceFunction(0x0032CD00u, &wrap32cd00b);
-        runtime.replaceFunction(0x003EC030u, &skip3ec030);
+        if (std::getenv("PS2_SKIP_FMV") && std::getenv("PS2_SKIP_FMV")[0] == '1')
+            runtime.replaceFunction(0x003EC030u, &skip3ec030);
         g_orig3170d0 = runtime.lookupFunction(0x003170D0u);
         if (g_orig3170d0)
             // PS2_SKIP_3170E0=1: leave 0x3170e0 unregistered so it hits missing-target and is
@@ -7751,6 +8379,8 @@ inline void dumpClusterCounts() {
         if (g_orig28a798) runtime.replaceFunction(0x0028A798u, &wrap28a798);
         g_orig32a978 = runtime.lookupFunction(0x0032A978u);
         if (g_orig32a978) runtime.replaceFunction(0x0032A978u, &wrap32a978);
+        if (!(std::getenv("PS2_SKIP_FMV") && std::getenv("PS2_SKIP_FMV")[0] == '1'))
+            primal_mpeg_hle::install(runtime);
         RUNTIME_LOG("[game_overrides] director/32eae8 repair installed: " << (ok ? "YES" : "NO"));
     }
 
